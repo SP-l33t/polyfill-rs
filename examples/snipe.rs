@@ -121,61 +121,8 @@ impl SnipeStrategy {
 
     /// Process order book update
     fn process_book_update(&mut self, book: BookUpdate) -> Result<()> {
-        // Ensure book exists
         self.book_manager.get_or_create_book(&self.token_id)?;
-
-        // Clear the existing book and rebuild from the snapshot.
-        if let Ok(current) = self.book_manager.get_book(&self.token_id) {
-            for level in &current.bids {
-                let _ = self.book_manager.apply_delta(OrderDelta {
-                    token_id: self.token_id.clone(),
-                    timestamp: chrono::Utc::now(),
-                    side: Side::BUY,
-                    price: level.price,
-                    size: Decimal::ZERO,
-                    sequence: book.timestamp,
-                });
-            }
-
-            for level in &current.asks {
-                let _ = self.book_manager.apply_delta(OrderDelta {
-                    token_id: self.token_id.clone(),
-                    timestamp: chrono::Utc::now(),
-                    side: Side::SELL,
-                    price: level.price,
-                    size: Decimal::ZERO,
-                    sequence: book.timestamp,
-                });
-            }
-        }
-
-        let ts = chrono::DateTime::from_timestamp(
-            (book.timestamp / 1000) as i64,
-            ((book.timestamp % 1000) * 1_000_000) as u32,
-        )
-        .unwrap_or_else(chrono::Utc::now);
-
-        for level in &book.bids {
-            let _ = self.book_manager.apply_delta(OrderDelta {
-                token_id: self.token_id.clone(),
-                timestamp: ts,
-                side: Side::BUY,
-                price: level.price,
-                size: level.size,
-                sequence: book.timestamp,
-            });
-        }
-
-        for level in &book.asks {
-            let _ = self.book_manager.apply_delta(OrderDelta {
-                token_id: self.token_id.clone(),
-                timestamp: ts,
-                side: Side::SELL,
-                price: level.price,
-                size: level.size,
-                sequence: book.timestamp,
-            });
-        }
+        self.book_manager.apply_book_update(&book)?;
 
         // Update best prices directly from the snapshot
         self.last_best_bid = book.bids.first().map(|l| l.price);
@@ -261,31 +208,16 @@ impl SnipeStrategy {
         };
 
         // Get current book for execution simulation
-        let book = self.book_manager.get_book(&self.token_id)?;
+        let book_snapshot = self.book_manager.get_book(&self.token_id)?;
         let mut book_impl = polyfill_rs::book::OrderBook::new(self.token_id.clone(), 100);
-
-        // Convert to internal book format
-        for level in &book.bids {
-            book_impl.apply_delta(OrderDelta {
-                token_id: self.token_id.clone(),
-                timestamp: chrono::Utc::now(),
-                side: Side::BUY,
-                price: level.price,
-                size: level.size,
-                sequence: 1,
-            })?;
-        }
-
-        for level in &book.asks {
-            book_impl.apply_delta(OrderDelta {
-                token_id: self.token_id.clone(),
-                timestamp: chrono::Utc::now(),
-                side: Side::SELL,
-                price: level.price,
-                size: level.size,
-                sequence: 2,
-            })?;
-        }
+        book_impl.apply_book_update(&polyfill_rs::types::BookUpdate {
+            asset_id: self.token_id.clone(),
+            market: "".to_string(),
+            timestamp: 1,
+            bids: book_snapshot.bids.into_iter().map(|l| polyfill_rs::types::OrderSummary { price: l.price, size: l.size }).collect(),
+            asks: book_snapshot.asks.into_iter().map(|l| polyfill_rs::types::OrderSummary { price: l.price, size: l.size }).collect(),
+            hash: None,
+        })?;
 
         // Execute order
         let start_time = std::time::Instant::now();

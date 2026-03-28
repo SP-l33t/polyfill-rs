@@ -201,27 +201,15 @@ impl PolyfillDemo {
                 let mut local_book = OrderBook::new(token_id.to_string(), 50);
 
                 // Apply order book data to local book
-                for (i, bid) in order_book.bids.iter().enumerate() {
-                    local_book.apply_delta(OrderDelta {
-                        token_id: token_id.to_string(),
-                        timestamp: chrono::Utc::now(),
-                        side: Side::BUY,
-                        price: bid.price,
-                        size: bid.size,
-                        sequence: i as u64,
-                    })?;
-                }
-
-                for (i, ask) in order_book.asks.iter().enumerate() {
-                    local_book.apply_delta(OrderDelta {
-                        token_id: token_id.to_string(),
-                        timestamp: chrono::Utc::now(),
-                        side: Side::SELL,
-                        price: ask.price,
-                        size: ask.size,
-                        sequence: (order_book.bids.len() + i) as u64,
-                    })?;
-                }
+                let update = polyfill_rs::types::BookUpdate {
+                    asset_id: token_id.to_string(),
+                    market: "".to_string(),
+                    timestamp: 1,
+                    bids: order_book.bids.clone(),
+                    asks: order_book.asks.clone(),
+                    hash: None,
+                };
+                local_book.apply_book_update(&update)?;
 
                 // Get analytics
                 let analytics = local_book.analytics();
@@ -380,28 +368,27 @@ impl PolyfillDemo {
         // Create a mock order book for testing
         let mut book = OrderBook::new("12345".to_string(), 50);
 
-        // Add some liquidity
-        for i in 1..=5 {
-            book.apply_delta(OrderDelta {
-                token_id: "12345".to_string(),
-                timestamp: chrono::Utc::now(),
-                side: Side::BUY,
+        let bids: Vec<polyfill_rs::types::OrderSummary> = (1..=5i64).map(|i| {
+            polyfill_rs::types::OrderSummary {
                 price: dec!(0.70) + Decimal::from(i) * dec!(0.01),
                 size: dec!(100.0),
-                sequence: i,
-            })?;
-        }
-
-        for i in 1..=5 {
-            book.apply_delta(OrderDelta {
-                token_id: "12345".to_string(),
-                timestamp: chrono::Utc::now(),
-                side: Side::SELL,
+            }
+        }).collect();
+        let asks: Vec<polyfill_rs::types::OrderSummary> = (1..=5i64).map(|i| {
+            polyfill_rs::types::OrderSummary {
                 price: dec!(0.80) + Decimal::from(i) * dec!(0.01),
                 size: dec!(100.0),
-                sequence: i + 10,
-            })?;
-        }
+            }
+        }).collect();
+
+        book.apply_book_update(&polyfill_rs::types::BookUpdate {
+            asset_id: "12345".to_string(),
+            market: "".to_string(),
+            timestamp: 1,
+            bids,
+            asks,
+            hash: None,
+        })?;
 
         info!("Created order book with liquidity");
 
@@ -645,29 +632,9 @@ impl PolyfillDemo {
 
             // Process message based on type
             match &message {
-                StreamMessage::Book(book) => {
-                    info!("  Processing book update for asset: {}", book.asset_id);
-                    // This is a demo: apply snapshot levels as deltas.
-                    for level in &book.bids {
-                        let _ = self.book_manager.apply_delta(OrderDelta {
-                            token_id: book.asset_id.clone(),
-                            timestamp: chrono::Utc::now(),
-                            side: Side::BUY,
-                            price: level.price,
-                            size: level.size,
-                            sequence: book.timestamp,
-                        });
-                    }
-                    for level in &book.asks {
-                        let _ = self.book_manager.apply_delta(OrderDelta {
-                            token_id: book.asset_id.clone(),
-                            timestamp: chrono::Utc::now(),
-                            side: Side::SELL,
-                            price: level.price,
-                            size: level.size,
-                            sequence: book.timestamp,
-                        });
-                    }
+                StreamMessage::Book(book_update) => {
+                    info!("  Processing book update for asset: {}", book_update.asset_id);
+                    let _ = self.book_manager.apply_book_update(&book_update);
                 },
                 StreamMessage::Trade(trade) => {
                     info!(

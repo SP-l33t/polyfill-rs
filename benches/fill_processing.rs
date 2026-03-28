@@ -7,11 +7,21 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use polyfill_rs::{
     book::OrderBook,
     fill::{FillEngine, FillProcessor},
-    types::{FillEvent, MarketOrderRequest, OrderDelta, Side},
+    types::{BookUpdate, FillEvent, MarketOrderRequest, OrderSummary, Side},
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::time::Instant;
+
+fn make_book_update(token_id: &str, timestamp: u64, bids: Vec<OrderSummary>, asks: Vec<OrderSummary>) -> BookUpdate {
+    BookUpdate {
+        asset_id: token_id.to_string(),
+        market: "0xabc".to_string(),
+        timestamp,
+        bids,
+        asks,
+        hash: None,
+    }
+}
 
 fn bench_fill_engine_creation(c: &mut Criterion) {
     c.bench_function("fill_engine_creation", |b| {
@@ -25,19 +35,15 @@ fn bench_market_order_execution(c: &mut Criterion) {
     let mut engine = FillEngine::new(dec!(1), dec!(5), 10);
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    // Pre-populate book with levels
-    for i in 1..=20 {
-        let price = Decimal::from(50 + i) / Decimal::from(100);
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-            price,
-            size: dec!(100),
-            sequence: i,
-        };
-        book.apply_delta(delta).unwrap();
-    }
+    let bids: Vec<OrderSummary> = (1..=10).map(|i| OrderSummary {
+        price: Decimal::from(50 + i) / Decimal::from(100),
+        size: dec!(100),
+    }).collect();
+    let asks: Vec<OrderSummary> = (1..=10).map(|i| OrderSummary {
+        price: Decimal::from(60 + i) / Decimal::from(100),
+        size: dec!(100),
+    }).collect();
+    book.apply_book_update(&make_book_update("test_token", 1, bids, asks)).unwrap();
 
     c.bench_function("market_order_execution", |b| {
         b.iter(|| {
@@ -48,7 +54,6 @@ fn bench_market_order_execution(c: &mut Criterion) {
                 slippage_tolerance: Some(dec!(1.0)),
                 client_id: Some("bench_order".to_string()),
             };
-
             let _result = engine.execute_market_order(&request, &book);
         });
     });
@@ -71,7 +76,6 @@ fn bench_fill_processor(c: &mut Criterion) {
                 taker_address: alloy_primitives::Address::ZERO,
                 fee: black_box(dec!(0.1)),
             };
-
             processor.process_fill(fill).unwrap();
         });
     });
@@ -80,20 +84,15 @@ fn bench_fill_processor(c: &mut Criterion) {
 fn bench_market_impact_calculation(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    // Pre-populate with realistic order book
-    for i in 1..=30 {
-        let price = Decimal::from(50 + i) / Decimal::from(100);
-        let size = Decimal::from(100 + i * 10);
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-            price,
-            size,
-            sequence: i,
-        };
-        book.apply_delta(delta).unwrap();
-    }
+    let bids: Vec<OrderSummary> = (1..=15).map(|i| OrderSummary {
+        price: Decimal::from(50 + i) / Decimal::from(100),
+        size: Decimal::from(100 + i * 10),
+    }).collect();
+    let asks: Vec<OrderSummary> = (1..=15).map(|i| OrderSummary {
+        price: Decimal::from(65 + i) / Decimal::from(100),
+        size: Decimal::from(100 + i * 10),
+    }).collect();
+    book.apply_book_update(&make_book_update("test_token", 1, bids, asks)).unwrap();
 
     c.bench_function("market_impact_calculation", |b| {
         b.iter(|| {
@@ -108,24 +107,18 @@ fn bench_high_frequency_fills(c: &mut Criterion) {
         b.iter(|| {
             let mut engine = FillEngine::new(dec!(1), dec!(2), 5);
             let mut book = OrderBook::new("test_token".to_string(), 100);
-            let start_time = Instant::now();
 
-            // Simulate high-frequency fill processing
-            for i in 1..=100 {
-                // Add some market depth
-                let price = Decimal::from(500 + (i % 10)) / Decimal::from(1000);
-                let size = Decimal::from(10 + (i % 90));
-                let delta = OrderDelta {
-                    token_id: "test_token".to_string(),
-                    timestamp: chrono::Utc::now(),
-                    side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-                    price,
-                    size,
-                    sequence: i,
-                };
-                book.apply_delta(delta).unwrap();
+            for i in 1u64..=100 {
+                let bids: Vec<OrderSummary> = (0..20).map(|j| OrderSummary {
+                    price: Decimal::from(5000 + j + (i % 10)) / Decimal::from(10000),
+                    size: Decimal::from(10 + (i % 90)),
+                }).collect();
+                let asks: Vec<OrderSummary> = (0..20).map(|j| OrderSummary {
+                    price: Decimal::from(6000 + j + (i % 10)) / Decimal::from(10000),
+                    size: Decimal::from(10 + (i % 90)),
+                }).collect();
+                book.apply_book_update(&make_book_update("test_token", i, bids, asks)).unwrap();
 
-                // Execute market orders
                 if i % 5 == 0 {
                     let request = MarketOrderRequest {
                         token_id: "test_token".to_string(),
@@ -134,13 +127,9 @@ fn bench_high_frequency_fills(c: &mut Criterion) {
                         slippage_tolerance: Some(dec!(1.0)),
                         client_id: Some(format!("order_{}", i)),
                     };
-
                     let _result = engine.execute_market_order(&request, &book);
                 }
             }
-
-            let duration = start_time.elapsed();
-            black_box(duration);
         });
     });
 }
@@ -148,26 +137,23 @@ fn bench_high_frequency_fills(c: &mut Criterion) {
 fn bench_fill_statistics(c: &mut Criterion) {
     let mut engine = FillEngine::new(dec!(1), dec!(5), 10);
 
-    // Add some fills
-    for i in 1..=100 {
+    for i in 1u64..=100 {
+        let side = if i % 2 == 0 { Side::BUY } else { Side::SELL };
         let request = MarketOrderRequest {
             token_id: "test_token".to_string(),
-            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
+            side,
             amount: dec!(10),
             slippage_tolerance: Some(dec!(1.0)),
             client_id: Some(format!("order_{}", i)),
         };
 
         let mut book = OrderBook::new("test_token".to_string(), 100);
-        book.apply_delta(OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: request.side.opposite(),
-            price: dec!(0.5),
-            size: dec!(100),
-            sequence: i,
-        })
-        .unwrap();
+        book.apply_book_update(&make_book_update(
+            "test_token",
+            i,
+            vec![OrderSummary { price: dec!(0.5), size: dec!(100) }],
+            vec![OrderSummary { price: dec!(0.55), size: dec!(100) }],
+        )).unwrap();
 
         let _result = engine.execute_market_order(&request, &book);
     }

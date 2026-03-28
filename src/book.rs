@@ -7,7 +7,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap; // BTreeMap keeps prices sorted automatically - crucial for order books
 use std::sync::{Arc, RwLock}; // For thread-safe access across multiple tasks
-use tracing::{debug, trace, warn}; // Logging for debugging and monitoring
+use tracing::debug; // Logging for debugging and monitoring
 
 /// High-performance order book implementation
 ///
@@ -311,90 +311,6 @@ impl OrderBook {
         }
     }
 
-    /// Apply a delta update to the book (LEGACY VERSION - for external API compatibility)
-    /// A "delta" is an incremental change - like "add 100 tokens at $0.65" or "remove all at $0.70"
-    ///
-    /// This method converts the external Decimal delta to our internal fixed-point format
-    /// and then calls the fast version. Use apply_delta_fast() directly when possible.
-    pub fn apply_delta(&mut self, delta: OrderDelta) -> Result<()> {
-        // Convert to fast internal format with tick alignment validation
-        let tick_size_decimal = self.tick_size_ticks.map(price_to_decimal);
-        let fast_delta = FastOrderDelta::from_order_delta(&delta, tick_size_decimal)
-            .map_err(|e| PolyfillError::validation(format!("Invalid delta: {}", e)))?;
-
-        // Use the fast internal version
-        self.apply_delta_fast(fast_delta)
-    }
-
-    /// Apply a delta update to the book
-    ///
-    /// This is the high-performance version that works directly with fixed-point data.
-    /// It includes tick alignment validation and is much faster than the Decimal version.
-    ///
-    /// Performance improvement: ~50x faster than the old Decimal version!
-    /// - No Decimal conversions in the hot path
-    /// - Integer comparisons instead of Decimal comparisons
-    /// - No memory allocations for price/size operations
-    pub fn apply_delta_fast(&mut self, delta: FastOrderDelta) -> Result<()> {
-        // Validate sequence ordering - ignore old updates that arrive late
-        // This is crucial for maintaining data integrity in real-time systems
-        if delta.sequence <= self.sequence {
-            trace!(
-                "Ignoring stale delta: {} <= {}",
-                delta.sequence,
-                self.sequence
-            );
-            return Ok(());
-        }
-
-        // Validate token ID hash matches (fast string comparison avoidance)
-        if delta.token_id_hash != self.token_id_hash {
-            return Err(PolyfillError::validation("Token ID mismatch"));
-        }
-
-        // TICK ALIGNMENT VALIDATION - this is where we enforce price rules
-        // If we have a tick size, make sure the price aligns properly
-        if let Some(tick_size_ticks) = self.tick_size_ticks {
-            // BEFORE (slow, ~200ns + multiple conversions):
-            // let tick_size_decimal = price_to_decimal(tick_size_ticks);
-            // if !is_price_tick_aligned(price_to_decimal(delta.price), tick_size_decimal) {
-            //     return Err(...);
-            // }
-
-            // AFTER (fast, ~2ns, pure integer):
-            if tick_size_ticks > 0 && !delta.price.is_multiple_of(tick_size_ticks) {
-                // Price is not aligned to tick size - reject the update
-                warn!(
-                    "Rejecting misaligned price: {} not divisible by tick size {}",
-                    delta.price, tick_size_ticks
-                );
-                return Err(PolyfillError::validation("Price not aligned to tick size"));
-            }
-        }
-
-        // Update our tracking info
-        self.sequence = delta.sequence;
-        self.timestamp = delta.timestamp;
-
-        // Apply the actual change to the appropriate side (FAST VERSION)
-        match delta.side {
-            Side::BUY => self.apply_bid_delta_fast(delta.price, delta.size),
-            Side::SELL => self.apply_ask_delta_fast(delta.price, delta.size),
-        }
-
-        // Keep the book from getting too deep (memory management)
-        self.trim_depth();
-
-        debug!(
-            "Applied fast delta: {} {} @ {} ticks (seq: {})",
-            delta.side.as_str(),
-            delta.size,
-            delta.price,
-            delta.sequence
-        );
-
-        Ok(())
-    }
 
     /// Begin applying a WebSocket `book` update (hot-path oriented).
     ///
@@ -415,6 +331,9 @@ impl OrderBook {
         self.sequence = timestamp;
         self.timestamp =
             chrono::DateTime::<Utc>::from_timestamp_millis(timestamp as i64).unwrap_or_else(Utc::now);
+
+        self.bids.clear();
+        self.asks.clear();
 
         Ok(true)
     }
@@ -443,29 +362,16 @@ impl OrderBook {
         Ok(())
     }
 
-    /// Finish applying a WS `book` update.
-    pub(crate) fn finish_ws_book_update(&mut self) {
-        self.trim_depth();
-    }
-
-    /// Apply a WebSocket `book` update for this token.
+    /// Apply a full orderbook snapshot from a WebSocket `book` event.
     ///
-    /// The official Polymarket CLOB WebSocket `book` event contains batches of
-    /// price levels for both sides. Unlike `apply_delta_fast`, this method can
-    /// apply many levels that share the same message timestamp.
-    ///
-    /// Notes:
-    /// - This performs upserts (update/insert/remove) for the provided levels.
-    /// - It does **not** infer removals for levels omitted from the message.
-    /// - Insertions of *new* price levels may allocate (BTreeMap node growth).
+    /// Clears both sides and inserts only the `max_depth` best levels per side.
+    /// Polymarket sends levels sorted worst-to-best, so best levels are at the
+    /// end of each array — we skip the leading worst levels.
     pub fn apply_book_update(&mut self, update: &BookUpdate) -> Result<()> {
         if update.asset_id != self.token_id {
             return Err(PolyfillError::validation("Token ID mismatch"));
         }
 
-        // Use the exchange-provided timestamp as our monotonic sequence marker.
-        // This is less strict than the REST/legacy delta sequence but works for
-        // ignoring obviously stale book snapshots.
         if update.timestamp <= self.sequence {
             return Ok(());
         }
@@ -474,8 +380,11 @@ impl OrderBook {
         self.timestamp = chrono::DateTime::<Utc>::from_timestamp_millis(update.timestamp as i64)
             .unwrap_or_else(Utc::now);
 
-        // Apply bids (BUY) and asks (SELL) as level upserts.
-        for level in &update.bids {
+        self.bids.clear();
+        self.asks.clear();
+
+        let bid_skip = update.bids.len().saturating_sub(self.max_depth);
+        for level in update.bids.iter().skip(bid_skip) {
             let price_ticks = decimal_to_price(level.price)
                 .map_err(|_| PolyfillError::validation("Invalid price"))?;
             let size_units = decimal_to_qty(level.size)
@@ -487,14 +396,13 @@ impl OrderBook {
                 }
             }
 
-            if size_units == 0 {
-                self.bids.remove(&price_ticks);
-            } else {
+            if size_units != 0 {
                 self.bids.insert(price_ticks, size_units);
             }
         }
 
-        for level in &update.asks {
+        let ask_skip = update.asks.len().saturating_sub(self.max_depth);
+        for level in update.asks.iter().skip(ask_skip) {
             let price_ticks = decimal_to_price(level.price)
                 .map_err(|_| PolyfillError::validation("Invalid price"))?;
             let size_units = decimal_to_qty(level.size)
@@ -506,41 +414,14 @@ impl OrderBook {
                 }
             }
 
-            if size_units == 0 {
-                self.asks.remove(&price_ticks);
-            } else {
+            if size_units != 0 {
                 self.asks.insert(price_ticks, size_units);
             }
         }
 
-        self.trim_depth();
         Ok(())
     }
 
-    /// Apply a bid-side delta (someone wants to buy) - LEGACY VERSION
-    /// If size is 0, it means "remove this price level entirely"
-    /// Otherwise, set the total size at this price level
-    ///
-    /// This converts to fixed-point and calls the fast version
-    #[allow(dead_code)]
-    fn apply_bid_delta(&mut self, price: Decimal, size: Decimal) {
-        // Convert to fixed-point (this should be rare since we use fast path)
-        let price_ticks = decimal_to_price(price).unwrap_or(0);
-        let size_units = decimal_to_qty(size).unwrap_or(0);
-        self.apply_bid_delta_fast(price_ticks, size_units);
-    }
-
-    /// Apply an ask-side delta (someone wants to sell) - LEGACY VERSION
-    /// Same logic as bids - size of 0 means remove the price level
-    ///
-    /// This converts to fixed-point and calls the fast version
-    #[allow(dead_code)]
-    fn apply_ask_delta(&mut self, price: Decimal, size: Decimal) {
-        // Convert to fixed-point (this should be rare since we use fast path)
-        let price_ticks = decimal_to_price(price).unwrap_or(0);
-        let size_units = decimal_to_qty(size).unwrap_or(0);
-        self.apply_ask_delta_fast(price_ticks, size_units);
-    }
 
     /// Apply a bid-side delta (someone wants to buy) - FAST VERSION
     ///
@@ -579,37 +460,6 @@ impl OrderBook {
             self.asks.remove(&price_ticks); // No more sellers at this price
         } else {
             self.asks.insert(price_ticks, size_units); // Update total size at this price
-        }
-    }
-
-    /// Trim the book to maintain depth limits
-    /// We don't want to track every single price level - just the best ones
-    ///
-    /// Why limit depth? Several reasons:
-    /// 1. Memory efficiency: A popular market might have thousands of price levels,
-    ///    but only the top 10-50 levels are actually tradeable with reasonable size
-    /// 2. Performance: Fewer levels = faster iteration when calculating market impact
-    /// 3. Relevance: Deep levels (like bids at $0.01 when best bid is $0.65) are
-    ///    mostly noise and will never get hit in normal trading
-    /// 4. Stale data: Deep levels often contain old orders that haven't been cancelled
-    /// 5. Network bandwidth: Less data to send when streaming updates
-    fn trim_depth(&mut self) {
-        // For bids, remove the LOWEST prices (worst bids) if we have too many
-        // Example: If best bid is $0.65, we don't care about bids at $0.10
-        if self.bids.len() > self.max_depth {
-            let to_remove = self.bids.len() - self.max_depth;
-            for _ in 0..to_remove {
-                self.bids.pop_first(); // Remove lowest bid prices (furthest from market)
-            }
-        }
-
-        // For asks, remove the HIGHEST prices (worst asks) if we have too many
-        // Example: If best ask is $0.67, we don't care about asks at $0.95
-        if self.asks.len() > self.max_depth {
-            let to_remove = self.asks.len() - self.max_depth;
-            for _ in 0..to_remove {
-                self.asks.pop_last(); // Remove highest ask prices (furthest from market)
-            }
         }
     }
 
@@ -749,6 +599,11 @@ impl OrderBook {
         qty_to_decimal(total_size_units)
     }
 
+    /// Get the maximum depth this book is configured to maintain
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
     /// Validate that prices are properly ordered
     /// A healthy book should have best bid < best ask (otherwise there's an arbitrage opportunity)
     pub fn is_valid(&self) -> bool {
@@ -837,25 +692,6 @@ impl OrderBookManager {
         f(book)
     }
 
-    /// Update a book with a delta
-    /// This is called when we receive real-time updates from the exchange
-    pub fn apply_delta(&self, delta: OrderDelta) -> Result<()> {
-        let mut books = self
-            .books
-            .write()
-            .map_err(|_| PolyfillError::internal_simple("Failed to acquire book lock"))?;
-
-        // Find the book for this token (must already exist)
-        let book = books.get_mut(&delta.token_id).ok_or_else(|| {
-            PolyfillError::market_data(
-                format!("No book found for token: {}", delta.token_id),
-                crate::errors::MarketDataErrorKind::TokenNotFound,
-            )
-        })?;
-
-        // Apply the update to the specific book
-        book.apply_delta(delta)
-    }
 
     /// Apply a WebSocket `book` update to a managed book.
     ///
@@ -1000,161 +836,27 @@ mod tests {
         assert_eq!(book.asks.len(), 0); // Should start empty
     }
 
-    #[test]
-    fn test_apply_delta() {
-        // Test that we can apply order book updates
-        let mut book = OrderBook::new("test_token".to_string(), 10);
-
-        // Create a buy order at $0.50 for 100 tokens
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: Utc::now(),
-            side: Side::BUY,
-            price: dec!(0.5),
-            size: dec!(100),
-            sequence: 1,
-        };
-
-        book.apply_delta(delta).unwrap();
-        assert_eq!(book.sequence, 1); // Sequence should update
-        assert_eq!(book.best_bid().unwrap().price, dec!(0.5)); // Should be our bid
-        assert_eq!(book.best_bid().unwrap().size, dec!(100)); // Should be our size
-    }
-
-    #[test]
-    fn test_spread_calculation() {
-        // Test that we can calculate the spread between bid and ask
-        let mut book = OrderBook::new("test_token".to_string(), 10);
-
-        // Add a bid at $0.50
-        book.apply_delta(OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: Utc::now(),
-            side: Side::BUY,
-            price: dec!(0.5),
-            size: dec!(100),
-            sequence: 1,
-        })
-        .unwrap();
-
-        // Add an ask at $0.52
-        book.apply_delta(OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: Utc::now(),
-            side: Side::SELL,
-            price: dec!(0.52),
-            size: dec!(100),
-            sequence: 2,
-        })
-        .unwrap();
-
-        let spread = book.spread().unwrap();
-        assert_eq!(spread, dec!(0.02)); // $0.52 - $0.50 = $0.02
-    }
-
-    #[test]
-    fn test_market_impact() {
-        // Test market impact calculation for a large order
-        let mut book = OrderBook::new("test_token".to_string(), 10);
-
-        // Add multiple ask levels (people selling at different prices)
-        // $0.50 for 100 tokens, $0.51 for 100 tokens, $0.52 for 100 tokens
-        for (i, price) in [dec!(0.50), dec!(0.51), dec!(0.52)].iter().enumerate() {
-            book.apply_delta(OrderDelta {
-                token_id: "test_token".to_string(),
-                timestamp: Utc::now(),
-                side: Side::SELL,
-                price: *price,
-                size: dec!(100),
-                sequence: i as u64 + 1,
-            })
-            .unwrap();
-        }
-
-        // Try to buy 150 tokens (will need to hit multiple price levels)
-        let impact = book.calculate_market_impact(Side::BUY, dec!(150)).unwrap();
-        assert!(impact.average_price > dec!(0.50)); // Should be worse than best price
-        assert!(impact.average_price < dec!(0.51)); // But not as bad as second level
-    }
-
-    #[test]
-    fn test_apply_bid_delta_legacy() {
-        let mut book = OrderBook::new("test_token".to_string(), 10);
-
-        // Test adding a bid
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("100.0").unwrap(),
-        );
-
-        let best_bid = book.best_bid();
-        assert!(best_bid.is_some());
-        let bid = best_bid.unwrap();
-        assert_eq!(bid.price, Decimal::from_str("0.75").unwrap());
-        assert_eq!(bid.size, Decimal::from_str("100.0").unwrap());
-
-        // Test updating the bid
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("150.0").unwrap(),
-        );
-        let updated_bid = book.best_bid().unwrap();
-        assert_eq!(updated_bid.size, Decimal::from_str("150.0").unwrap());
-
-        // Test removing the bid
-        book.apply_bid_delta(Decimal::from_str("0.75").unwrap(), Decimal::ZERO);
-        assert!(book.best_bid().is_none());
-    }
-
-    #[test]
-    fn test_apply_ask_delta_legacy() {
-        let mut book = OrderBook::new("test_token".to_string(), 10);
-
-        // Test adding an ask
-        book.apply_ask_delta(
-            Decimal::from_str("0.76").unwrap(),
-            Decimal::from_str("50.0").unwrap(),
-        );
-
-        let best_ask = book.best_ask();
-        assert!(best_ask.is_some());
-        let ask = best_ask.unwrap();
-        assert_eq!(ask.price, Decimal::from_str("0.76").unwrap());
-        assert_eq!(ask.size, Decimal::from_str("50.0").unwrap());
-
-        // Test updating the ask
-        book.apply_ask_delta(
-            Decimal::from_str("0.76").unwrap(),
-            Decimal::from_str("75.0").unwrap(),
-        );
-        let updated_ask = book.best_ask().unwrap();
-        assert_eq!(updated_ask.size, Decimal::from_str("75.0").unwrap());
-
-        // Test removing the ask
-        book.apply_ask_delta(Decimal::from_str("0.76").unwrap(), Decimal::ZERO);
-        assert!(book.best_ask().is_none());
-    }
 
     #[test]
     fn test_liquidity_analysis() {
         let mut book = OrderBook::new("test_token".to_string(), 10);
 
-        // Build order book using legacy methods
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("100.0").unwrap(),
+        // Build order book using fast methods
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.75").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("100.0").unwrap()).unwrap(),
         );
-        book.apply_bid_delta(
-            Decimal::from_str("0.74").unwrap(),
-            Decimal::from_str("50.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.74").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("50.0").unwrap()).unwrap(),
         );
-        book.apply_ask_delta(
-            Decimal::from_str("0.76").unwrap(),
-            Decimal::from_str("80.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.76").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("80.0").unwrap()).unwrap(),
         );
-        book.apply_ask_delta(
-            Decimal::from_str("0.77").unwrap(),
-            Decimal::from_str("120.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.77").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("120.0").unwrap()).unwrap(),
         );
 
         // Test liquidity at specific price - when buying, we look at ask liquidity
@@ -1193,20 +895,20 @@ mod tests {
         assert!(book.is_valid());
 
         // Add normal levels
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("100.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.75").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("100.0").unwrap()).unwrap(),
         );
-        book.apply_ask_delta(
-            Decimal::from_str("0.76").unwrap(),
-            Decimal::from_str("80.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.76").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("80.0").unwrap()).unwrap(),
         );
         assert!(book.is_valid());
 
         // Create crossed book (invalid) - bid higher than ask
-        book.apply_bid_delta(
-            Decimal::from_str("0.77").unwrap(),
-            Decimal::from_str("50.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.77").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("50.0").unwrap()).unwrap(),
         );
         assert!(!book.is_valid());
     }
@@ -1219,9 +921,9 @@ mod tests {
         assert!(!book.is_stale(Duration::from_secs(60))); // 60 second threshold
 
         // Add some data
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("100.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.75").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("100.0").unwrap()).unwrap(),
         );
         assert!(!book.is_stale(Duration::from_secs(60)));
 
@@ -1234,30 +936,30 @@ mod tests {
         let mut book = OrderBook::new("test_token".to_string(), 3); // Only 3 levels
 
         // Add multiple levels
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("100.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.75").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("100.0").unwrap()).unwrap(),
         );
-        book.apply_bid_delta(
-            Decimal::from_str("0.74").unwrap(),
-            Decimal::from_str("50.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.74").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("50.0").unwrap()).unwrap(),
         );
-        book.apply_bid_delta(
-            Decimal::from_str("0.73").unwrap(),
-            Decimal::from_str("20.0").unwrap(),
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.73").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("20.0").unwrap()).unwrap(),
         );
 
-        book.apply_ask_delta(
-            Decimal::from_str("0.76").unwrap(),
-            Decimal::from_str("80.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.76").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("80.0").unwrap()).unwrap(),
         );
-        book.apply_ask_delta(
-            Decimal::from_str("0.77").unwrap(),
-            Decimal::from_str("40.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.77").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("40.0").unwrap()).unwrap(),
         );
-        book.apply_ask_delta(
-            Decimal::from_str("0.78").unwrap(),
-            Decimal::from_str("30.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.78").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("30.0").unwrap()).unwrap(),
         );
 
         // Should have levels on each side
@@ -1282,14 +984,14 @@ mod tests {
     fn test_fast_operations() {
         let mut book = OrderBook::new("test_token".to_string(), 10);
 
-        // Test using legacy methods which call fast operations internally
-        book.apply_bid_delta(
-            Decimal::from_str("0.75").unwrap(),
-            Decimal::from_str("100.0").unwrap(),
+        // Test using fast methods directly
+        book.apply_bid_delta_fast(
+            decimal_to_price(Decimal::from_str("0.75").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("100.0").unwrap()).unwrap(),
         );
-        book.apply_ask_delta(
-            Decimal::from_str("0.76").unwrap(),
-            Decimal::from_str("80.0").unwrap(),
+        book.apply_ask_delta_fast(
+            decimal_to_price(Decimal::from_str("0.76").unwrap()).unwrap(),
+            decimal_to_qty(Decimal::from_str("80.0").unwrap()).unwrap(),
         );
 
         let best_bid_fast = book.best_bid_fast();
@@ -1304,5 +1006,166 @@ mod tests {
 
         assert!(spread_fast.is_some()); // Should have a spread
         assert!(mid_fast.is_some()); // Should have a mid price
+    }
+
+    #[test]
+    fn test_apply_book_update() {
+        let mut book = OrderBook::new("test_token".to_string(), 10);
+
+        let update = BookUpdate {
+            asset_id: "test_token".to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![
+                OrderSummary { price: dec!(0.50), size: dec!(100) },
+                OrderSummary { price: dec!(0.49), size: dec!(200) },
+            ],
+            asks: vec![
+                OrderSummary { price: dec!(0.52), size: dec!(150) },
+            ],
+            hash: None,
+        };
+
+        book.apply_book_update(&update).unwrap();
+        assert_eq!(book.sequence, 1);
+        assert_eq!(book.best_bid().unwrap().price, dec!(0.50));
+        assert_eq!(book.best_bid().unwrap().size, dec!(100));
+        assert_eq!(book.best_ask().unwrap().price, dec!(0.52));
+    }
+
+    #[test]
+    fn test_snapshot_replaces_book() {
+        let mut book = OrderBook::new("test_token".to_string(), 10);
+
+        let update1 = BookUpdate {
+            asset_id: "test_token".to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![
+                OrderSummary { price: dec!(0.50), size: dec!(100) },
+                OrderSummary { price: dec!(0.49), size: dec!(200) },
+            ],
+            asks: vec![
+                OrderSummary { price: dec!(0.55), size: dec!(300) },
+            ],
+            hash: None,
+        };
+        book.apply_book_update(&update1).unwrap();
+
+        let update2 = BookUpdate {
+            asset_id: "test_token".to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 2,
+            bids: vec![
+                OrderSummary { price: dec!(0.60), size: dec!(50) },
+            ],
+            asks: vec![
+                OrderSummary { price: dec!(0.62), size: dec!(75) },
+            ],
+            hash: None,
+        };
+        book.apply_book_update(&update2).unwrap();
+
+        // Old levels (0.49, 0.50, 0.55) must be gone
+        let bids = book.bids(None);
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].price, dec!(0.60));
+
+        let asks = book.asks(None);
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].price, dec!(0.62));
+    }
+
+    #[test]
+    fn test_max_depth_cutoff_polymarket_ordering() {
+        // Polymarket sends levels worst-to-best:
+        //   Bids: lowest first → highest last (best bid = last)
+        //   Asks: highest first → lowest last (best ask = last)
+        let mut book = OrderBook::new("test_token".to_string(), 3);
+
+        let update = BookUpdate {
+            asset_id: "test_token".to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![
+                // Worst to best (Polymarket order)
+                OrderSummary { price: dec!(0.01), size: dec!(500) },
+                OrderSummary { price: dec!(0.02), size: dec!(400) },
+                OrderSummary { price: dec!(0.03), size: dec!(300) },
+                OrderSummary { price: dec!(0.04), size: dec!(200) },
+                OrderSummary { price: dec!(0.05), size: dec!(100) },
+            ],
+            asks: vec![
+                // Worst to best (Polymarket order)
+                OrderSummary { price: dec!(0.99), size: dec!(500) },
+                OrderSummary { price: dec!(0.98), size: dec!(400) },
+                OrderSummary { price: dec!(0.97), size: dec!(300) },
+                OrderSummary { price: dec!(0.96), size: dec!(200) },
+                OrderSummary { price: dec!(0.95), size: dec!(100) },
+            ],
+            hash: None,
+        };
+
+        book.apply_book_update(&update).unwrap();
+
+        // Should keep 3 best bids (closest to spread = highest prices)
+        let bids = book.bids(None);
+        assert_eq!(bids.len(), 3);
+        assert_eq!(bids[0].price, dec!(0.05)); // best bid
+        assert_eq!(bids[1].price, dec!(0.04));
+        assert_eq!(bids[2].price, dec!(0.03));
+
+        // Should keep 3 best asks (closest to spread = lowest prices)
+        let asks = book.asks(None);
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[0].price, dec!(0.95)); // best ask
+        assert_eq!(asks[1].price, dec!(0.96));
+        assert_eq!(asks[2].price, dec!(0.97));
+
+        // Spread should be between best bid and best ask
+        assert_eq!(book.best_bid().unwrap().price, dec!(0.05));
+        assert_eq!(book.best_ask().unwrap().price, dec!(0.95));
+        assert_eq!(book.spread().unwrap(), dec!(0.90));
+    }
+
+    #[test]
+    fn test_spread_calculation() {
+        let mut book = OrderBook::new("test_token".to_string(), 10);
+
+        let update = BookUpdate {
+            asset_id: "test_token".to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![OrderSummary { price: dec!(0.50), size: dec!(100) }],
+            asks: vec![OrderSummary { price: dec!(0.52), size: dec!(100) }],
+            hash: None,
+        };
+        book.apply_book_update(&update).unwrap();
+
+        let spread = book.spread().unwrap();
+        assert_eq!(spread, dec!(0.02));
+    }
+
+    #[test]
+    fn test_market_impact() {
+        let mut book = OrderBook::new("test_token".to_string(), 10);
+
+        let update = BookUpdate {
+            asset_id: "test_token".to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![],
+            asks: vec![
+                OrderSummary { price: dec!(0.50), size: dec!(100) },
+                OrderSummary { price: dec!(0.51), size: dec!(100) },
+                OrderSummary { price: dec!(0.52), size: dec!(100) },
+            ],
+            hash: None,
+        };
+        book.apply_book_update(&update).unwrap();
+
+        let impact = book.calculate_market_impact(Side::BUY, dec!(150)).unwrap();
+        assert!(impact.average_price > dec!(0.50));
+        assert!(impact.average_price < dec!(0.51));
     }
 }

@@ -108,12 +108,12 @@ Market data endpoints test failed: API error (404): Token not found
 
 Our integration tests include performance measurements:
 
-| Operation | Expected Time | Actual Time |
-|-----------|---------------|-------------|
-| Server Time | < 5s | 234ms |
-| Markets Request | < 10s | 1.2s |
-| Order Book | < 5s | 890ms |
-| Price Quote | < 3s | 156ms |
+| Operation       | Expected Time | Actual Time |
+|-----------------|---------------|-------------|
+| Server Time     | < 5s          | 234ms       |
+| Markets Request | < 10s         | 1.2s        |
+| Order Book      | < 5s          | 890ms       |
+| Price Quote     | < 3s          | 156ms       |
 
 ## Troubleshooting
 
