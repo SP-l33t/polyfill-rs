@@ -114,7 +114,6 @@ pub use crate::types::{
     Order,
     OrderBook,
     OrderBookSummary,
-    OrderDelta,
     OrderRequest,
     OrderScoringResponse,
     OrderStatus,
@@ -198,38 +197,6 @@ pub mod types;
 pub mod utils;
 pub mod ws_hot_path;
 
-// Benchmarks
-#[cfg(test)]
-mod benches {
-    use crate::{OrderBookManager, OrderDelta, Side};
-    use chrono::Utc;
-    use criterion::{criterion_group, criterion_main};
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
-
-    #[allow(dead_code)]
-    fn order_book_benchmark(c: &mut criterion::Criterion) {
-        let book_manager = OrderBookManager::new(100);
-
-        c.bench_function("apply_order_delta", |b| {
-            b.iter(|| {
-                let delta = OrderDelta {
-                    token_id: "test_token".to_string(),
-                    timestamp: Utc::now(),
-                    side: Side::BUY,
-                    price: Decimal::from_str("0.75").unwrap(),
-                    size: Decimal::from_str("100.0").unwrap(),
-                    sequence: 1,
-                };
-
-                let _ = book_manager.apply_delta(delta);
-            });
-        });
-    }
-
-    criterion_group!(benches, order_book_benchmark);
-    criterion_main!(benches);
-}
 
 #[cfg(test)]
 mod tests {

@@ -152,36 +152,6 @@ pub fn qty_to_decimal(units: Qty) -> Decimal {
     Decimal::from(units) / Decimal::from(SCALE_FACTOR)
 }
 
-/// Check if a price is properly tick-aligned
-///
-/// This is used to validate incoming price data. In a well-behaved system,
-/// all prices should already be tick-aligned, but we check anyway to catch
-/// bugs or malicious data.
-///
-/// A price is tick-aligned if it's an exact multiple of the minimum tick size.
-/// Since we use integer ticks internally, this just checks if the price
-/// converts cleanly to our internal representation.
-pub fn is_price_tick_aligned(decimal: Decimal, tick_size_decimal: Decimal) -> bool {
-    // Convert tick size to our internal representation
-    let tick_size_ticks = match decimal_to_price(tick_size_decimal) {
-        Ok(ticks) => ticks,
-        Err(_) => return false,
-    };
-
-    // Convert the price to ticks
-    let price_ticks = match decimal_to_price(decimal) {
-        Ok(ticks) => ticks,
-        Err(_) => return false,
-    };
-
-    // Check if price is a multiple of tick size
-    // If tick_size_ticks is 0, we consider everything aligned (no restrictions)
-    if tick_size_ticks == 0 {
-        return true;
-    }
-
-    price_ticks % tick_size_ticks == 0
-}
 
 /// Trading side for orders
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -383,99 +353,6 @@ pub struct OrderBook {
     pub sequence: u64,
 }
 
-/// Order book delta for streaming updates - EXTERNAL API VERSION
-///
-/// This is what we receive from WebSocket streams and REST API calls.
-/// It uses Decimal for compatibility with external systems.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrderDelta {
-    pub token_id: String,
-    pub timestamp: DateTime<Utc>,
-    pub side: Side,
-    pub price: Decimal,
-    pub size: Decimal, // 0 means remove level
-    pub sequence: u64,
-}
-
-/// Order book delta for streaming updates - INTERNAL HOT PATH VERSION
-///
-/// This is what we use internally for processing order book updates.
-/// Converting to this format on ingress gives us massive performance gains.
-///
-/// Why the performance matters:
-/// - We might process 10,000+ deltas per second in active markets
-/// - Each delta triggers multiple calculations (spread, impact, etc.)
-/// - Using integers instead of Decimal can make the difference between
-///   keeping up with the market feed vs falling behind
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FastOrderDelta {
-    pub token_id_hash: u64, // Hash of token_id for fast lookup (avoids string comparisons)
-    pub timestamp: DateTime<Utc>,
-    pub side: Side,
-    pub price: Price, // Price in ticks
-    pub size: Qty,    // Size in fixed-point units (0 means remove level)
-    pub sequence: u64,
-}
-
-impl FastOrderDelta {
-    /// Create from external OrderDelta with validation and tick alignment
-    ///
-    /// This is where we enforce tick alignment - if the incoming price
-    /// doesn't align to valid ticks, we either reject it or round it.
-    /// This prevents bad data from corrupting our order book.
-    pub fn from_order_delta(
-        delta: &OrderDelta,
-        tick_size: Option<Decimal>,
-    ) -> std::result::Result<Self, &'static str> {
-        // Validate tick alignment if we have a tick size
-        if let Some(tick_size) = tick_size {
-            if !is_price_tick_aligned(delta.price, tick_size) {
-                return Err("Price not aligned to tick size");
-            }
-        }
-
-        // Convert to fixed-point with validation
-        let price = decimal_to_price(delta.price)?;
-        let size = decimal_to_qty(delta.size)?;
-
-        // Hash the token_id for fast lookups
-        // This avoids string comparisons in the hot path
-        let token_id_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            delta.token_id.hash(&mut hasher);
-            hasher.finish()
-        };
-
-        Ok(Self {
-            token_id_hash,
-            timestamp: delta.timestamp,
-            side: delta.side,
-            price,
-            size,
-            sequence: delta.sequence,
-        })
-    }
-
-    /// Convert back to external OrderDelta (for API responses)
-    /// We need the original token_id since we only store the hash
-    pub fn to_order_delta(self, token_id: String) -> OrderDelta {
-        OrderDelta {
-            token_id,
-            timestamp: self.timestamp,
-            side: self.side,
-            price: price_to_decimal(self.price),
-            size: qty_to_decimal(self.size),
-            sequence: self.sequence,
-        }
-    }
-
-    /// Check if this delta removes a level (size is zero)
-    pub fn is_removal(self) -> bool {
-        self.size == 0
-    }
-}
 
 /// Trade execution event
 #[derive(Debug, Clone, Serialize, Deserialize)]

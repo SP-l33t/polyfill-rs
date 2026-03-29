@@ -133,15 +133,15 @@ fn process_stream_object<'tape, 'input>(
             return Ok(0);
         }
 
+        let max_depth = book.max_depth();
         let mut applied = 0usize;
         if let Some(bids) = bids {
-            applied += apply_levels(book, Side::BUY, bids)?;
+            applied += apply_levels(book, Side::BUY, bids, bids.len().saturating_sub(max_depth))?;
         }
         if let Some(asks) = asks {
-            applied += apply_levels(book, Side::SELL, asks)?;
+            applied += apply_levels(book, Side::SELL, asks, asks.len().saturating_sub(max_depth))?;
         }
 
-        book.finish_ws_book_update();
         Ok(applied)
     })?;
 
@@ -161,9 +161,14 @@ fn apply_levels<'tape, 'input>(
     book: &mut crate::book::OrderBook,
     side: Side,
     levels: simd_json::tape::Array<'tape, 'input>,
+    skip: usize,
 ) -> Result<usize> {
     let mut applied = 0usize;
-    for level in levels.iter() {
+    for (i, level) in levels.iter().enumerate() {
+        if i < skip {
+            continue;
+        }
+
         let Some(obj) = level.as_object() else {
             continue;
         };

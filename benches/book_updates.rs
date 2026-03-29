@@ -1,16 +1,31 @@
-//! Benchmark for order book updates
-//!
-//! This benchmark measures the performance of order book operations
-//! including delta application, price updates, and book maintenance.
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use polyfill_rs::{
     book::OrderBook,
-    types::{OrderDelta, Side},
+    types::{BookUpdate, OrderSummary, Side},
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::time::Instant;
+use std::sync::Arc;
+
+fn make_book_update(token_id: &str, timestamp: u64, bids: Vec<OrderSummary>, asks: Vec<OrderSummary>) -> BookUpdate {
+    BookUpdate {
+        asset_id: token_id.to_string(),
+        market: "0xabc".to_string(),
+        timestamp,
+        bids,
+        asks,
+        hash: None,
+    }
+}
+
+fn make_levels(base_price: u64, count: u64, size: Decimal) -> Vec<OrderSummary> {
+    (0..count)
+        .map(|i| OrderSummary {
+            price: Decimal::from(base_price + i) / Decimal::from(10000),
+            size,
+        })
+        .collect()
+}
 
 fn bench_book_creation(c: &mut Criterion) {
     c.bench_function("book_creation", |b| {
@@ -20,34 +35,27 @@ fn bench_book_creation(c: &mut Criterion) {
     });
 }
 
-fn bench_delta_application(c: &mut Criterion) {
+fn bench_snapshot_application(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    // Pre-populate with some levels
-    for i in 1..=10 {
-        let price = Decimal::from(50 + i) / Decimal::from(100);
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: Side::BUY,
-            price,
-            size: dec!(100),
-            sequence: i,
-        };
-        book.apply_delta(delta).unwrap();
-    }
+    // Warm up with a realistic snapshot
+    book.apply_book_update(&make_book_update(
+        "test_token", 1,
+        make_levels(5000, 20, dec!(100)),
+        make_levels(6000, 20, dec!(100)),
+    )).unwrap();
 
-    c.bench_function("delta_application", |b| {
+    c.bench_function("snapshot_application_20_levels", |b| {
+        let mut ts = 2u64;
         b.iter(|| {
-            let delta = OrderDelta {
-                token_id: "test_token".to_string(),
-                timestamp: chrono::Utc::now(),
-                side: black_box(Side::SELL),
-                price: black_box(dec!(0.52)),
-                size: black_box(dec!(50)),
-                sequence: black_box(11),
-            };
-            book.apply_delta(delta).unwrap();
+            ts += 1;
+            let update = make_book_update(
+                "test_token",
+                ts,
+                make_levels(5000 + (ts % 10), 20, dec!(100)),
+                make_levels(6000 + (ts % 10), 20, dec!(100)),
+            );
+            book.apply_book_update(&update).unwrap();
         });
     });
 }
@@ -55,19 +63,11 @@ fn bench_delta_application(c: &mut Criterion) {
 fn bench_best_price_lookup(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    // Pre-populate with levels
-    for i in 1..=20 {
-        let price = Decimal::from(50 + i) / Decimal::from(100);
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-            price,
-            size: dec!(100),
-            sequence: i,
-        };
-        book.apply_delta(delta).unwrap();
-    }
+    book.apply_book_update(&make_book_update(
+        "test_token", 1,
+        make_levels(5000, 10, dec!(100)),
+        make_levels(6000, 10, dec!(100)),
+    )).unwrap();
 
     c.bench_function("best_price_lookup", |b| {
         b.iter(|| {
@@ -82,19 +82,11 @@ fn bench_best_price_lookup(c: &mut Criterion) {
 fn bench_book_snapshot(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    // Pre-populate with levels
-    for i in 1..=50 {
-        let price = Decimal::from(50 + i) / Decimal::from(100);
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-            price,
-            size: dec!(100),
-            sequence: i,
-        };
-        book.apply_delta(delta).unwrap();
-    }
+    book.apply_book_update(&make_book_update(
+        "test_token", 1,
+        make_levels(5000, 25, dec!(100)),
+        make_levels(7500, 25, dec!(100)),
+    )).unwrap();
 
     c.bench_function("book_snapshot", |b| {
         b.iter(|| {
@@ -106,19 +98,11 @@ fn bench_book_snapshot(c: &mut Criterion) {
 fn bench_market_impact_calculation(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    // Pre-populate with levels
-    for i in 1..=30 {
-        let price = Decimal::from(50 + i) / Decimal::from(100);
-        let delta = OrderDelta {
-            token_id: "test_token".to_string(),
-            timestamp: chrono::Utc::now(),
-            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-            price,
-            size: dec!(100),
-            sequence: i,
-        };
-        book.apply_delta(delta).unwrap();
-    }
+    book.apply_book_update(&make_book_update(
+        "test_token", 1,
+        make_levels(5000, 15, dec!(100)),
+        make_levels(6500, 15, dec!(100)),
+    )).unwrap();
 
     c.bench_function("market_impact_calculation", |b| {
         b.iter(|| {
@@ -127,82 +111,118 @@ fn bench_market_impact_calculation(c: &mut Criterion) {
     });
 }
 
-fn bench_high_frequency_updates(c: &mut Criterion) {
-    c.bench_function("high_frequency_updates", |b| {
+fn bench_max_depth_cutoff(c: &mut Criterion) {
+    // Main perf win: max_depth=20, but snapshot has 200 levels per side.
+    // We stop parsing after 20, skipping 180 levels of work.
+    let mut book = OrderBook::new("test_token".to_string(), 20);
+
+    // Warm up
+    book.apply_book_update(&make_book_update(
+        "test_token", 1,
+        make_levels(5000, 200, dec!(100)),
+        make_levels(7000, 200, dec!(100)),
+    )).unwrap();
+
+    c.bench_function("snapshot_200_levels_depth_20", |b| {
+        let mut ts = 2u64;
         b.iter(|| {
-            let mut book = OrderBook::new("test_token".to_string(), 100);
-            let start_time = Instant::now();
+            ts += 1;
+            let update = make_book_update(
+                "test_token",
+                ts,
+                make_levels(5000 + (ts % 10), 200, dec!(100)),
+                make_levels(7000 + (ts % 10), 200, dec!(100)),
+            );
+            book.apply_book_update(&update).unwrap();
+        });
+    });
 
-            // Simulate high-frequency updates
-            for i in 1..=1000 {
-                let price = Decimal::from(500 + (i % 100)) / Decimal::from(1000);
-                let size = Decimal::from(10 + (i % 90));
-                let delta = OrderDelta {
-                    token_id: "test_token".to_string(),
-                    timestamp: chrono::Utc::now(),
-                    side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-                    price,
-                    size,
-                    sequence: i,
-                };
-                book.apply_delta(delta).unwrap();
+    // Compare: same 200 levels but max_depth=200 (no cutoff)
+    let mut book_full = OrderBook::new("test_token".to_string(), 200);
+    book_full.apply_book_update(&make_book_update(
+        "test_token", 1,
+        make_levels(5000, 200, dec!(100)),
+        make_levels(7000, 200, dec!(100)),
+    )).unwrap();
 
-                // Check prices every 10 updates
+    c.bench_function("snapshot_200_levels_depth_200", |b| {
+        let mut ts = 2u64;
+        b.iter(|| {
+            ts += 1;
+            let update = make_book_update(
+                "test_token",
+                ts,
+                make_levels(5000 + (ts % 10), 200, dec!(100)),
+                make_levels(7000 + (ts % 10), 200, dec!(100)),
+            );
+            book_full.apply_book_update(&update).unwrap();
+        });
+    });
+}
+
+fn bench_high_frequency_updates(c: &mut Criterion) {
+    c.bench_function("high_frequency_snapshots_50_levels", |b| {
+        b.iter(|| {
+            let mut book = OrderBook::new("test_token".to_string(), 50);
+
+            for i in 1u64..=100 {
+                let update = make_book_update(
+                    "test_token",
+                    i,
+                    make_levels(5000 + (i % 20), 50, Decimal::from(10 + (i % 90))),
+                    make_levels(7000 + (i % 20), 50, Decimal::from(10 + (i % 90))),
+                );
+                book.apply_book_update(&update).unwrap();
+
                 if i % 10 == 0 {
                     let _bid = book.best_bid();
                     let _ask = book.best_ask();
                 }
             }
-
-            let duration = start_time.elapsed();
-            black_box(duration);
         });
     });
 }
 
 fn bench_concurrent_access(c: &mut Criterion) {
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use polyfill_rs::book::OrderBookManager;
 
     c.bench_function("concurrent_access", |b| {
         b.iter(|| {
-            let book = Arc::new(RwLock::new(OrderBook::new("test_token".to_string(), 100)));
-            let book_clone = book.clone();
+            let manager = Arc::new(OrderBookManager::new(100));
+            manager.get_or_create_book("test_token").unwrap();
 
-            // Simulate concurrent reads and writes
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let mut tasks = Vec::new();
 
-                // Spawn writer tasks
-                for i in 1..=10 {
-                    let book = book.clone();
+                for i in 1u64..=10 {
+                    let mgr = manager.clone();
                     tasks.push(tokio::spawn(async move {
-                        let price = Decimal::from(50 + i) / Decimal::from(100);
-                        let delta = OrderDelta {
-                            token_id: "test_token".to_string(),
-                            timestamp: chrono::Utc::now(),
-                            side: if i % 2 == 0 { Side::BUY } else { Side::SELL },
-                            price,
-                            size: dec!(100),
-                            sequence: i,
+                        let update = BookUpdate {
+                            asset_id: "test_token".to_string(),
+                            market: "0xabc".to_string(),
+                            timestamp: i,
+                            bids: (0..20).map(|j| OrderSummary {
+                                price: Decimal::from(5000 + j + i) / Decimal::from(10000),
+                                size: dec!(100),
+                            }).collect(),
+                            asks: (0..20).map(|j| OrderSummary {
+                                price: Decimal::from(6000 + j + i) / Decimal::from(10000),
+                                size: dec!(100),
+                            }).collect(),
+                            hash: None,
                         };
-                        let mut book = book.write().await;
-                        book.apply_delta(delta).unwrap();
+                        let _ = mgr.apply_book_update(&update);
                     }));
                 }
 
-                // Spawn reader tasks
                 for _ in 0..20 {
-                    let book = book_clone.clone();
+                    let mgr = manager.clone();
                     tasks.push(tokio::spawn(async move {
-                        let book = book.read().await;
-                        let _bid = book.best_bid();
-                        let _ask = book.best_ask();
+                        let _ = mgr.get_book("test_token");
                     }));
                 }
 
-                // Wait for all tasks
                 for task in tasks {
                     let _ = task.await;
                 }
@@ -214,10 +234,11 @@ fn bench_concurrent_access(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_book_creation,
-    bench_delta_application,
+    bench_snapshot_application,
     bench_best_price_lookup,
     bench_book_snapshot,
     bench_market_impact_calculation,
+    bench_max_depth_cutoff,
     bench_high_frequency_updates,
     bench_concurrent_access,
 );
