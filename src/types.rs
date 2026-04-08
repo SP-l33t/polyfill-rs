@@ -185,6 +185,10 @@ pub enum TradeMessageStatus {
     Mined,
     #[serde(alias = "confirmed", alias = "CONFIRMED")]
     Confirmed,
+    #[serde(alias = "retrying", alias = "RETRYING")]
+    Retrying,
+    #[serde(alias = "failed", alias = "FAILED")]
+    Failed,
     /// Forward-compatible catch-all for unknown statuses.
     #[serde(untagged)]
     Unknown(String),
