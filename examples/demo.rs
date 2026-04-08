@@ -368,18 +368,18 @@ impl PolyfillDemo {
         // Create a mock order book for testing
         let mut book = OrderBook::new("12345".to_string(), 50);
 
-        let bids: Vec<polyfill_rs::types::OrderSummary> = (1..=5i64).map(|i| {
-            polyfill_rs::types::OrderSummary {
+        let bids: Vec<polyfill_rs::types::OrderSummary> = (1..=5i64)
+            .map(|i| polyfill_rs::types::OrderSummary {
                 price: dec!(0.70) + Decimal::from(i) * dec!(0.01),
                 size: dec!(100.0),
-            }
-        }).collect();
-        let asks: Vec<polyfill_rs::types::OrderSummary> = (1..=5i64).map(|i| {
-            polyfill_rs::types::OrderSummary {
+            })
+            .collect();
+        let asks: Vec<polyfill_rs::types::OrderSummary> = (1..=5i64)
+            .map(|i| polyfill_rs::types::OrderSummary {
                 price: dec!(0.80) + Decimal::from(i) * dec!(0.01),
                 size: dec!(100.0),
-            }
-        }).collect();
+            })
+            .collect();
 
         book.apply_book_update(&polyfill_rs::types::BookUpdate {
             asset_id: "12345".to_string(),
@@ -633,7 +633,10 @@ impl PolyfillDemo {
             // Process message based on type
             match &message {
                 StreamMessage::Book(book_update) => {
-                    info!("  Processing book update for asset: {}", book_update.asset_id);
+                    info!(
+                        "  Processing book update for asset: {}",
+                        book_update.asset_id
+                    );
                     let _ = self.book_manager.apply_book_update(&book_update);
                 },
                 StreamMessage::Trade(trade) => {

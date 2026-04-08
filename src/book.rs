@@ -311,7 +311,6 @@ impl OrderBook {
         }
     }
 
-
     /// Begin applying a WebSocket `book` update (hot-path oriented).
     ///
     /// This is intended for in-place WS processing where we *stream* levels out of a decoded
@@ -329,8 +328,8 @@ impl OrderBook {
         }
 
         self.sequence = timestamp;
-        self.timestamp =
-            chrono::DateTime::<Utc>::from_timestamp_millis(timestamp as i64).unwrap_or_else(Utc::now);
+        self.timestamp = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp as i64)
+            .unwrap_or_else(Utc::now);
 
         self.bids.clear();
         self.asks.clear();
@@ -421,7 +420,6 @@ impl OrderBook {
 
         Ok(())
     }
-
 
     /// Apply a bid-side delta (someone wants to buy) - FAST VERSION
     ///
@@ -692,7 +690,6 @@ impl OrderBookManager {
         f(book)
     }
 
-
     /// Apply a WebSocket `book` update to a managed book.
     ///
     /// This is the preferred way to ingest `StreamMessage::Book` updates into
@@ -835,7 +832,6 @@ mod tests {
         assert_eq!(book.bids.len(), 0); // Should start empty
         assert_eq!(book.asks.len(), 0); // Should start empty
     }
-
 
     #[test]
     fn test_liquidity_analysis() {
@@ -1017,12 +1013,19 @@ mod tests {
             market: "0xabc".to_string(),
             timestamp: 1,
             bids: vec![
-                OrderSummary { price: dec!(0.50), size: dec!(100) },
-                OrderSummary { price: dec!(0.49), size: dec!(200) },
+                OrderSummary {
+                    price: dec!(0.50),
+                    size: dec!(100),
+                },
+                OrderSummary {
+                    price: dec!(0.49),
+                    size: dec!(200),
+                },
             ],
-            asks: vec![
-                OrderSummary { price: dec!(0.52), size: dec!(150) },
-            ],
+            asks: vec![OrderSummary {
+                price: dec!(0.52),
+                size: dec!(150),
+            }],
             hash: None,
         };
 
@@ -1042,12 +1045,19 @@ mod tests {
             market: "0xabc".to_string(),
             timestamp: 1,
             bids: vec![
-                OrderSummary { price: dec!(0.50), size: dec!(100) },
-                OrderSummary { price: dec!(0.49), size: dec!(200) },
+                OrderSummary {
+                    price: dec!(0.50),
+                    size: dec!(100),
+                },
+                OrderSummary {
+                    price: dec!(0.49),
+                    size: dec!(200),
+                },
             ],
-            asks: vec![
-                OrderSummary { price: dec!(0.55), size: dec!(300) },
-            ],
+            asks: vec![OrderSummary {
+                price: dec!(0.55),
+                size: dec!(300),
+            }],
             hash: None,
         };
         book.apply_book_update(&update1).unwrap();
@@ -1056,12 +1066,14 @@ mod tests {
             asset_id: "test_token".to_string(),
             market: "0xabc".to_string(),
             timestamp: 2,
-            bids: vec![
-                OrderSummary { price: dec!(0.60), size: dec!(50) },
-            ],
-            asks: vec![
-                OrderSummary { price: dec!(0.62), size: dec!(75) },
-            ],
+            bids: vec![OrderSummary {
+                price: dec!(0.60),
+                size: dec!(50),
+            }],
+            asks: vec![OrderSummary {
+                price: dec!(0.62),
+                size: dec!(75),
+            }],
             hash: None,
         };
         book.apply_book_update(&update2).unwrap();
@@ -1089,19 +1101,49 @@ mod tests {
             timestamp: 1,
             bids: vec![
                 // Worst to best (Polymarket order)
-                OrderSummary { price: dec!(0.01), size: dec!(500) },
-                OrderSummary { price: dec!(0.02), size: dec!(400) },
-                OrderSummary { price: dec!(0.03), size: dec!(300) },
-                OrderSummary { price: dec!(0.04), size: dec!(200) },
-                OrderSummary { price: dec!(0.05), size: dec!(100) },
+                OrderSummary {
+                    price: dec!(0.01),
+                    size: dec!(500),
+                },
+                OrderSummary {
+                    price: dec!(0.02),
+                    size: dec!(400),
+                },
+                OrderSummary {
+                    price: dec!(0.03),
+                    size: dec!(300),
+                },
+                OrderSummary {
+                    price: dec!(0.04),
+                    size: dec!(200),
+                },
+                OrderSummary {
+                    price: dec!(0.05),
+                    size: dec!(100),
+                },
             ],
             asks: vec![
                 // Worst to best (Polymarket order)
-                OrderSummary { price: dec!(0.99), size: dec!(500) },
-                OrderSummary { price: dec!(0.98), size: dec!(400) },
-                OrderSummary { price: dec!(0.97), size: dec!(300) },
-                OrderSummary { price: dec!(0.96), size: dec!(200) },
-                OrderSummary { price: dec!(0.95), size: dec!(100) },
+                OrderSummary {
+                    price: dec!(0.99),
+                    size: dec!(500),
+                },
+                OrderSummary {
+                    price: dec!(0.98),
+                    size: dec!(400),
+                },
+                OrderSummary {
+                    price: dec!(0.97),
+                    size: dec!(300),
+                },
+                OrderSummary {
+                    price: dec!(0.96),
+                    size: dec!(200),
+                },
+                OrderSummary {
+                    price: dec!(0.95),
+                    size: dec!(100),
+                },
             ],
             hash: None,
         };
@@ -1136,8 +1178,14 @@ mod tests {
             asset_id: "test_token".to_string(),
             market: "0xabc".to_string(),
             timestamp: 1,
-            bids: vec![OrderSummary { price: dec!(0.50), size: dec!(100) }],
-            asks: vec![OrderSummary { price: dec!(0.52), size: dec!(100) }],
+            bids: vec![OrderSummary {
+                price: dec!(0.50),
+                size: dec!(100),
+            }],
+            asks: vec![OrderSummary {
+                price: dec!(0.52),
+                size: dec!(100),
+            }],
             hash: None,
         };
         book.apply_book_update(&update).unwrap();
@@ -1156,9 +1204,18 @@ mod tests {
             timestamp: 1,
             bids: vec![],
             asks: vec![
-                OrderSummary { price: dec!(0.50), size: dec!(100) },
-                OrderSummary { price: dec!(0.51), size: dec!(100) },
-                OrderSummary { price: dec!(0.52), size: dec!(100) },
+                OrderSummary {
+                    price: dec!(0.50),
+                    size: dec!(100),
+                },
+                OrderSummary {
+                    price: dec!(0.51),
+                    size: dec!(100),
+                },
+                OrderSummary {
+                    price: dec!(0.52),
+                    size: dec!(100),
+                },
             ],
             hash: None,
         };

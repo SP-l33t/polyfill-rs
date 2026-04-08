@@ -197,7 +197,6 @@ pub mod types;
 pub mod utils;
 pub mod ws_hot_path;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,12 @@ use polyfill_rs::{
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-fn make_book_update(token_id: &str, timestamp: u64, bids: Vec<OrderSummary>, asks: Vec<OrderSummary>) -> BookUpdate {
+fn make_book_update(
+    token_id: &str,
+    timestamp: u64,
+    bids: Vec<OrderSummary>,
+    asks: Vec<OrderSummary>,
+) -> BookUpdate {
     BookUpdate {
         asset_id: token_id.to_string(),
         market: "0xabc".to_string(),
@@ -35,15 +40,20 @@ fn bench_market_order_execution(c: &mut Criterion) {
     let mut engine = FillEngine::new(dec!(1), dec!(5), 10);
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    let bids: Vec<OrderSummary> = (1..=10).map(|i| OrderSummary {
-        price: Decimal::from(50 + i) / Decimal::from(100),
-        size: dec!(100),
-    }).collect();
-    let asks: Vec<OrderSummary> = (1..=10).map(|i| OrderSummary {
-        price: Decimal::from(60 + i) / Decimal::from(100),
-        size: dec!(100),
-    }).collect();
-    book.apply_book_update(&make_book_update("test_token", 1, bids, asks)).unwrap();
+    let bids: Vec<OrderSummary> = (1..=10)
+        .map(|i| OrderSummary {
+            price: Decimal::from(50 + i) / Decimal::from(100),
+            size: dec!(100),
+        })
+        .collect();
+    let asks: Vec<OrderSummary> = (1..=10)
+        .map(|i| OrderSummary {
+            price: Decimal::from(60 + i) / Decimal::from(100),
+            size: dec!(100),
+        })
+        .collect();
+    book.apply_book_update(&make_book_update("test_token", 1, bids, asks))
+        .unwrap();
 
     c.bench_function("market_order_execution", |b| {
         b.iter(|| {
@@ -84,15 +94,20 @@ fn bench_fill_processor(c: &mut Criterion) {
 fn bench_market_impact_calculation(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
-    let bids: Vec<OrderSummary> = (1..=15).map(|i| OrderSummary {
-        price: Decimal::from(50 + i) / Decimal::from(100),
-        size: Decimal::from(100 + i * 10),
-    }).collect();
-    let asks: Vec<OrderSummary> = (1..=15).map(|i| OrderSummary {
-        price: Decimal::from(65 + i) / Decimal::from(100),
-        size: Decimal::from(100 + i * 10),
-    }).collect();
-    book.apply_book_update(&make_book_update("test_token", 1, bids, asks)).unwrap();
+    let bids: Vec<OrderSummary> = (1..=15)
+        .map(|i| OrderSummary {
+            price: Decimal::from(50 + i) / Decimal::from(100),
+            size: Decimal::from(100 + i * 10),
+        })
+        .collect();
+    let asks: Vec<OrderSummary> = (1..=15)
+        .map(|i| OrderSummary {
+            price: Decimal::from(65 + i) / Decimal::from(100),
+            size: Decimal::from(100 + i * 10),
+        })
+        .collect();
+    book.apply_book_update(&make_book_update("test_token", 1, bids, asks))
+        .unwrap();
 
     c.bench_function("market_impact_calculation", |b| {
         b.iter(|| {
@@ -109,15 +124,20 @@ fn bench_high_frequency_fills(c: &mut Criterion) {
             let mut book = OrderBook::new("test_token".to_string(), 100);
 
             for i in 1u64..=100 {
-                let bids: Vec<OrderSummary> = (0..20).map(|j| OrderSummary {
-                    price: Decimal::from(5000 + j + (i % 10)) / Decimal::from(10000),
-                    size: Decimal::from(10 + (i % 90)),
-                }).collect();
-                let asks: Vec<OrderSummary> = (0..20).map(|j| OrderSummary {
-                    price: Decimal::from(6000 + j + (i % 10)) / Decimal::from(10000),
-                    size: Decimal::from(10 + (i % 90)),
-                }).collect();
-                book.apply_book_update(&make_book_update("test_token", i, bids, asks)).unwrap();
+                let bids: Vec<OrderSummary> = (0..20)
+                    .map(|j| OrderSummary {
+                        price: Decimal::from(5000 + j + (i % 10)) / Decimal::from(10000),
+                        size: Decimal::from(10 + (i % 90)),
+                    })
+                    .collect();
+                let asks: Vec<OrderSummary> = (0..20)
+                    .map(|j| OrderSummary {
+                        price: Decimal::from(6000 + j + (i % 10)) / Decimal::from(10000),
+                        size: Decimal::from(10 + (i % 90)),
+                    })
+                    .collect();
+                book.apply_book_update(&make_book_update("test_token", i, bids, asks))
+                    .unwrap();
 
                 if i % 5 == 0 {
                     let request = MarketOrderRequest {
@@ -151,9 +171,16 @@ fn bench_fill_statistics(c: &mut Criterion) {
         book.apply_book_update(&make_book_update(
             "test_token",
             i,
-            vec![OrderSummary { price: dec!(0.5), size: dec!(100) }],
-            vec![OrderSummary { price: dec!(0.55), size: dec!(100) }],
-        )).unwrap();
+            vec![OrderSummary {
+                price: dec!(0.5),
+                size: dec!(100),
+            }],
+            vec![OrderSummary {
+                price: dec!(0.55),
+                size: dec!(100),
+            }],
+        ))
+        .unwrap();
 
         let _result = engine.execute_market_order(&request, &book);
     }

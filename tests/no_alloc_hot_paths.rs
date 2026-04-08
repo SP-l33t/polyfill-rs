@@ -2,9 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::str::FromStr;
 
-use polyfill_rs::{
-    book::OrderBookManager, OrderBookImpl, WebSocketStream, WsBookUpdateProcessor,
-};
+use polyfill_rs::{book::OrderBookManager, OrderBookImpl, WebSocketStream, WsBookUpdateProcessor};
 use rust_decimal::Decimal;
 
 thread_local! {
@@ -82,7 +80,8 @@ fn no_alloc_mid_and_spread_fast() {
             size: Decimal::from_str("100.0").unwrap(),
         }],
         hash: None,
-    }).unwrap();
+    })
+    .unwrap();
 
     let _ = allocation_count();
 
@@ -113,7 +112,8 @@ fn no_alloc_apply_book_update_existing_levels() {
             size: Decimal::from_str("100.0").unwrap(),
         }],
         hash: None,
-    }).unwrap();
+    })
+    .unwrap();
 
     let update = polyfill_rs::types::BookUpdate {
         asset_id: asset_id.to_string(),
@@ -146,20 +146,22 @@ fn no_alloc_book_manager_apply_book_update_existing_levels() {
     manager.get_or_create_book(asset_id).unwrap();
 
     // Warm up the internal book with initial levels (allocations allowed).
-    manager.apply_book_update(&polyfill_rs::types::BookUpdate {
-        asset_id: asset_id.to_string(),
-        market: "0xabc".to_string(),
-        timestamp: 1,
-        bids: vec![polyfill_rs::types::OrderSummary {
-            price: Decimal::from_str("0.75").unwrap(),
-            size: Decimal::from_str("100.0").unwrap(),
-        }],
-        asks: vec![polyfill_rs::types::OrderSummary {
-            price: Decimal::from_str("0.76").unwrap(),
-            size: Decimal::from_str("100.0").unwrap(),
-        }],
-        hash: None,
-    }).unwrap();
+    manager
+        .apply_book_update(&polyfill_rs::types::BookUpdate {
+            asset_id: asset_id.to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![polyfill_rs::types::OrderSummary {
+                price: Decimal::from_str("0.75").unwrap(),
+                size: Decimal::from_str("100.0").unwrap(),
+            }],
+            asks: vec![polyfill_rs::types::OrderSummary {
+                price: Decimal::from_str("0.76").unwrap(),
+                size: Decimal::from_str("100.0").unwrap(),
+            }],
+            hash: None,
+        })
+        .unwrap();
 
     let update = polyfill_rs::types::BookUpdate {
         asset_id: asset_id.to_string(),
@@ -191,20 +193,22 @@ fn no_alloc_ws_book_update_processor_apply_existing_levels() {
     manager.get_or_create_book(asset_id).unwrap();
 
     // Warm up the internal book with initial levels (allocations allowed).
-    manager.apply_book_update(&polyfill_rs::types::BookUpdate {
-        asset_id: asset_id.to_string(),
-        market: "0xabc".to_string(),
-        timestamp: 1,
-        bids: vec![polyfill_rs::types::OrderSummary {
-            price: Decimal::from_str("0.75").unwrap(),
-            size: Decimal::from_str("100.0").unwrap(),
-        }],
-        asks: vec![polyfill_rs::types::OrderSummary {
-            price: Decimal::from_str("0.76").unwrap(),
-            size: Decimal::from_str("100.0").unwrap(),
-        }],
-        hash: None,
-    }).unwrap();
+    manager
+        .apply_book_update(&polyfill_rs::types::BookUpdate {
+            asset_id: asset_id.to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![polyfill_rs::types::OrderSummary {
+                price: Decimal::from_str("0.75").unwrap(),
+                size: Decimal::from_str("100.0").unwrap(),
+            }],
+            asks: vec![polyfill_rs::types::OrderSummary {
+                price: Decimal::from_str("0.76").unwrap(),
+                size: Decimal::from_str("100.0").unwrap(),
+            }],
+            hash: None,
+        })
+        .unwrap();
 
     let mut processor = WsBookUpdateProcessor::new(1024);
 
@@ -239,20 +243,22 @@ fn no_alloc_websocket_book_applier_apply_text_message_existing_levels() {
     manager.get_or_create_book(asset_id).unwrap();
 
     // Warm up the internal book with initial levels (allocations allowed).
-    manager.apply_book_update(&polyfill_rs::types::BookUpdate {
-        asset_id: asset_id.to_string(),
-        market: "0xabc".to_string(),
-        timestamp: 1,
-        bids: vec![polyfill_rs::types::OrderSummary {
-            price: Decimal::from_str("0.75").unwrap(),
-            size: Decimal::from_str("100.0").unwrap(),
-        }],
-        asks: vec![polyfill_rs::types::OrderSummary {
-            price: Decimal::from_str("0.76").unwrap(),
-            size: Decimal::from_str("100.0").unwrap(),
-        }],
-        hash: None,
-    }).unwrap();
+    manager
+        .apply_book_update(&polyfill_rs::types::BookUpdate {
+            asset_id: asset_id.to_string(),
+            market: "0xabc".to_string(),
+            timestamp: 1,
+            bids: vec![polyfill_rs::types::OrderSummary {
+                price: Decimal::from_str("0.75").unwrap(),
+                size: Decimal::from_str("100.0").unwrap(),
+            }],
+            asks: vec![polyfill_rs::types::OrderSummary {
+                price: Decimal::from_str("0.76").unwrap(),
+                size: Decimal::from_str("100.0").unwrap(),
+            }],
+            hash: None,
+        })
+        .unwrap();
 
     let processor = WsBookUpdateProcessor::new(1024);
     let stream = WebSocketStream::new("wss://example.com/ws");

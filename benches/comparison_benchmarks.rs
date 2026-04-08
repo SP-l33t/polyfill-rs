@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use polyfill_rs::{OrderArgs, OrderBookImpl, Side};
 use polyfill_rs::types::{BookUpdate, OrderSummary};
+use polyfill_rs::{OrderArgs, OrderBookImpl, Side};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
@@ -35,14 +35,18 @@ fn benchmark_order_book_operations(c: &mut Criterion) {
             let mut book = OrderBookImpl::new("test_token".to_string(), 100);
 
             for i in 1u64..=100 {
-                let bids: Vec<OrderSummary> = (0..50).map(|j| OrderSummary {
-                    price: Decimal::from_str(&format!("0.{:04}", 5000 + j + (i % 20))).unwrap(),
-                    size: Decimal::from_str("100.0").unwrap(),
-                }).collect();
-                let asks: Vec<OrderSummary> = (0..50).map(|j| OrderSummary {
-                    price: Decimal::from_str(&format!("0.{:04}", 6000 + j + (i % 20))).unwrap(),
-                    size: Decimal::from_str("100.0").unwrap(),
-                }).collect();
+                let bids: Vec<OrderSummary> = (0..50)
+                    .map(|j| OrderSummary {
+                        price: Decimal::from_str(&format!("0.{:04}", 5000 + j + (i % 20))).unwrap(),
+                        size: Decimal::from_str("100.0").unwrap(),
+                    })
+                    .collect();
+                let asks: Vec<OrderSummary> = (0..50)
+                    .map(|j| OrderSummary {
+                        price: Decimal::from_str(&format!("0.{:04}", 6000 + j + (i % 20))).unwrap(),
+                        size: Decimal::from_str("100.0").unwrap(),
+                    })
+                    .collect();
                 let update = BookUpdate {
                     asset_id: "test_token".to_string(),
                     market: "0xabc".to_string(),
@@ -81,7 +85,8 @@ fn benchmark_fast_operations(c: &mut Criterion) {
         bids,
         asks,
         hash: None,
-    }).unwrap();
+    })
+    .unwrap();
 
     c.bench_function("fast_spread_mid_calculations", |b| {
         b.iter(|| {

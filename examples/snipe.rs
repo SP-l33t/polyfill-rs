@@ -214,8 +214,22 @@ impl SnipeStrategy {
             asset_id: self.token_id.clone(),
             market: "".to_string(),
             timestamp: 1,
-            bids: book_snapshot.bids.into_iter().map(|l| polyfill_rs::types::OrderSummary { price: l.price, size: l.size }).collect(),
-            asks: book_snapshot.asks.into_iter().map(|l| polyfill_rs::types::OrderSummary { price: l.price, size: l.size }).collect(),
+            bids: book_snapshot
+                .bids
+                .into_iter()
+                .map(|l| polyfill_rs::types::OrderSummary {
+                    price: l.price,
+                    size: l.size,
+                })
+                .collect(),
+            asks: book_snapshot
+                .asks
+                .into_iter()
+                .map(|l| polyfill_rs::types::OrderSummary {
+                    price: l.price,
+                    size: l.size,
+                })
+                .collect(),
             hash: None,
         })?;
 

@@ -7,7 +7,12 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 
-fn make_book_update(token_id: &str, timestamp: u64, bids: Vec<OrderSummary>, asks: Vec<OrderSummary>) -> BookUpdate {
+fn make_book_update(
+    token_id: &str,
+    timestamp: u64,
+    bids: Vec<OrderSummary>,
+    asks: Vec<OrderSummary>,
+) -> BookUpdate {
     BookUpdate {
         asset_id: token_id.to_string(),
         market: "0xabc".to_string(),
@@ -40,10 +45,12 @@ fn bench_snapshot_application(c: &mut Criterion) {
 
     // Warm up with a realistic snapshot
     book.apply_book_update(&make_book_update(
-        "test_token", 1,
+        "test_token",
+        1,
         make_levels(5000, 20, dec!(100)),
         make_levels(6000, 20, dec!(100)),
-    )).unwrap();
+    ))
+    .unwrap();
 
     c.bench_function("snapshot_application_20_levels", |b| {
         let mut ts = 2u64;
@@ -64,10 +71,12 @@ fn bench_best_price_lookup(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
     book.apply_book_update(&make_book_update(
-        "test_token", 1,
+        "test_token",
+        1,
         make_levels(5000, 10, dec!(100)),
         make_levels(6000, 10, dec!(100)),
-    )).unwrap();
+    ))
+    .unwrap();
 
     c.bench_function("best_price_lookup", |b| {
         b.iter(|| {
@@ -83,10 +92,12 @@ fn bench_book_snapshot(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
     book.apply_book_update(&make_book_update(
-        "test_token", 1,
+        "test_token",
+        1,
         make_levels(5000, 25, dec!(100)),
         make_levels(7500, 25, dec!(100)),
-    )).unwrap();
+    ))
+    .unwrap();
 
     c.bench_function("book_snapshot", |b| {
         b.iter(|| {
@@ -99,10 +110,12 @@ fn bench_market_impact_calculation(c: &mut Criterion) {
     let mut book = OrderBook::new("test_token".to_string(), 100);
 
     book.apply_book_update(&make_book_update(
-        "test_token", 1,
+        "test_token",
+        1,
         make_levels(5000, 15, dec!(100)),
         make_levels(6500, 15, dec!(100)),
-    )).unwrap();
+    ))
+    .unwrap();
 
     c.bench_function("market_impact_calculation", |b| {
         b.iter(|| {
@@ -118,10 +131,12 @@ fn bench_max_depth_cutoff(c: &mut Criterion) {
 
     // Warm up
     book.apply_book_update(&make_book_update(
-        "test_token", 1,
+        "test_token",
+        1,
         make_levels(5000, 200, dec!(100)),
         make_levels(7000, 200, dec!(100)),
-    )).unwrap();
+    ))
+    .unwrap();
 
     c.bench_function("snapshot_200_levels_depth_20", |b| {
         let mut ts = 2u64;
@@ -139,11 +154,14 @@ fn bench_max_depth_cutoff(c: &mut Criterion) {
 
     // Compare: same 200 levels but max_depth=200 (no cutoff)
     let mut book_full = OrderBook::new("test_token".to_string(), 200);
-    book_full.apply_book_update(&make_book_update(
-        "test_token", 1,
-        make_levels(5000, 200, dec!(100)),
-        make_levels(7000, 200, dec!(100)),
-    )).unwrap();
+    book_full
+        .apply_book_update(&make_book_update(
+            "test_token",
+            1,
+            make_levels(5000, 200, dec!(100)),
+            make_levels(7000, 200, dec!(100)),
+        ))
+        .unwrap();
 
     c.bench_function("snapshot_200_levels_depth_200", |b| {
         let mut ts = 2u64;
@@ -202,14 +220,18 @@ fn bench_concurrent_access(c: &mut Criterion) {
                             asset_id: "test_token".to_string(),
                             market: "0xabc".to_string(),
                             timestamp: i,
-                            bids: (0..20).map(|j| OrderSummary {
-                                price: Decimal::from(5000 + j + i) / Decimal::from(10000),
-                                size: dec!(100),
-                            }).collect(),
-                            asks: (0..20).map(|j| OrderSummary {
-                                price: Decimal::from(6000 + j + i) / Decimal::from(10000),
-                                size: dec!(100),
-                            }).collect(),
+                            bids: (0..20)
+                                .map(|j| OrderSummary {
+                                    price: Decimal::from(5000 + j + i) / Decimal::from(10000),
+                                    size: dec!(100),
+                                })
+                                .collect(),
+                            asks: (0..20)
+                                .map(|j| OrderSummary {
+                                    price: Decimal::from(6000 + j + i) / Decimal::from(10000),
+                                    size: dec!(100),
+                                })
+                                .collect(),
                             hash: None,
                         };
                         let _ = mgr.apply_book_update(&update);

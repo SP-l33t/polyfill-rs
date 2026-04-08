@@ -11,11 +11,14 @@ use crate::http_config::{
 use crate::types::{OrderOptions, PostOrder, SignedOrderRequest};
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
+use futures::future::try_join_all;
 use reqwest::header::HeaderName;
 use reqwest::Client;
 use reqwest::{Method, RequestBuilder};
 use rust_decimal::Decimal;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 // Re-export types for compatibility
 pub use crate::types::{ApiCredentials as ApiCreds, OrderType, Side};
@@ -65,6 +68,11 @@ pub struct ClobClient {
     connection_manager: Option<std::sync::Arc<crate::connection_manager::ConnectionManager>>,
     #[allow(dead_code)]
     buffer_pool: std::sync::Arc<crate::buffer_pool::BufferPool>,
+    /// Permanent cache of neg_risk per token_id. neg_risk is set at market creation
+    /// and never changes, so a single lookup per token amortizes across the lifetime
+    /// of the client. Only held across synchronous HashMap accesses, never across
+    /// `await` points.
+    neg_risk_cache: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl ClobClient {
@@ -134,6 +142,7 @@ impl ClobClient {
             dns_cache,
             connection_manager,
             buffer_pool,
+            neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -164,6 +173,7 @@ impl ClobClient {
             dns_cache: None,
             connection_manager,
             buffer_pool,
+            neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -194,6 +204,7 @@ impl ClobClient {
             dns_cache: None,
             connection_manager,
             buffer_pool,
+            neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -232,6 +243,7 @@ impl ClobClient {
             dns_cache,
             connection_manager,
             buffer_pool,
+            neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -281,6 +293,7 @@ impl ClobClient {
             dns_cache,
             connection_manager,
             buffer_pool,
+            neg_risk_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -830,6 +843,55 @@ impl ClobClient {
         }
     }
 
+    /// Resolve neg_risk for a token, consulting the permanent cache first.
+    ///
+    /// neg_risk is set at market creation and never changes, so a cache hit
+    /// returns immediately without any HTTP. On miss, falls back to the raw
+    /// `get_neg_risk` HTTP path and populates the cache for next time.
+    ///
+    /// Benign race: two concurrent first-touch lookups for the same token
+    /// can both miss, both fetch, and both insert. The second insert
+    /// overwrites with the same value — no correctness issue, no locking
+    /// across `await`.
+    async fn resolve_neg_risk_cached(&self, token_id: &str) -> Result<bool> {
+        // Fast path: read lock, check cache.
+        if let Some(&nr) = self.neg_risk_cache.read().unwrap().get(token_id) {
+            return Ok(nr);
+        }
+        // Slow path: fetch, insert, return.
+        let nr = self.get_neg_risk(token_id).await?;
+        self.neg_risk_cache
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), nr);
+        Ok(nr)
+    }
+
+    /// Preload neg_risk for a set of tokens in parallel. Useful for cold-start
+    /// prewarming before the first batch of orders.
+    ///
+    /// Issues all lookups concurrently. On the first HTTP failure, returns `Err`
+    /// immediately; any entries that already succeeded remain in the cache
+    /// (harmless — they are correct values).
+    pub async fn warmup_neg_risk(&self, token_ids: &[&str]) -> Result<()> {
+        if token_ids.is_empty() {
+            return Ok(());
+        }
+        let futures = token_ids
+            .iter()
+            .map(|&tid| async move {
+                let nr = self.get_neg_risk(tid).await?;
+                Ok::<(String, bool), PolyfillError>((tid.to_string(), nr))
+            })
+            .collect::<Vec<_>>();
+        let results = futures::future::try_join_all(futures).await?;
+        let mut guard = self.neg_risk_cache.write().unwrap();
+        for (tid, nr) in results {
+            guard.insert(tid, nr);
+        }
+        Ok(())
+    }
+
     /// Get filled order options
     async fn get_filled_order_options(
         &self,
@@ -844,7 +906,7 @@ impl ClobClient {
         let tick_size = self.resolve_tick_size(token_id, tick_size).await?;
         let neg_risk = match neg_risk {
             Some(nr) => nr,
-            None => self.get_neg_risk(token_id).await?,
+            None => self.resolve_neg_risk_cached(token_id).await?,
         };
 
         Ok(OrderOptions {
@@ -1079,30 +1141,146 @@ impl ClobClient {
             .await
     }
 
-    /// Create and post multiple orders in one call with an explicit order type
-    pub async fn create_and_post_orders_with_type(
+    /// Inner implementation shared by both public batch create+post methods.
+    ///
+    /// Flow:
+    /// 1. Fast-fail validation (empty, >15 orders) — before any HTTP.
+    /// 2. Collect unique token_ids from the batch.
+    /// 3. For each unique token, queue missing tick_size / neg_risk lookups.
+    ///    Queued lookups are fired concurrently via `try_join_all`.
+    /// 4. Build a resolved-options map keyed by token_id.
+    /// 5. Per-order price-range validation against resolved tick_size — fast-fail.
+    /// 6. Sign each order directly via `order_builder.create_order` to avoid
+    ///    re-fetching options through `self.create_order`.
+    /// 7. Single POST via `self.post_orders`.
+    async fn create_and_post_orders_inner(
         &self,
         order_args: &[OrderArgs],
+        options: Option<&OrderOptions>,
         order_type: OrderType,
     ) -> Result<Vec<crate::types::PostOrderResponse>> {
+        // 1. Fast-fail validation — before any HTTP.
         if order_args.is_empty() {
             return Err(PolyfillError::validation("order_args cannot be empty"));
         }
-
-        let mut orders = Vec::with_capacity(order_args.len());
-        for args in order_args {
-            orders.push(self.create_order(args, None, None, None).await?);
+        if order_args.len() > 15 {
+            return Err(PolyfillError::validation(
+                "orders cannot exceed 15 items per batch",
+            ));
         }
 
-        self.post_orders(orders, order_type).await
+        let order_builder = self
+            .order_builder
+            .as_ref()
+            .ok_or_else(|| PolyfillError::auth("Order builder not initialized"))?;
+
+        // 2. Collect unique token_ids. Linear scan since batch <= 15.
+        let mut unique_tokens: Vec<&str> = Vec::with_capacity(order_args.len());
+        for args in order_args {
+            let tid = args.token_id.as_str();
+            if !unique_tokens.contains(&tid) {
+                unique_tokens.push(tid);
+            }
+        }
+
+        // 3. Extract caller-supplied hints.
+        let (supplied_tick, supplied_neg, supplied_fee) = match options {
+            Some(o) => (o.tick_size, o.neg_risk, o.fee_rate_bps),
+            None => (None, None, None),
+        };
+
+        // 3a. Build tick_size future list: one per unique token if not supplied.
+        let tick_futures = unique_tokens.iter().map(|&tid| async move {
+            match supplied_tick {
+                Some(t) => Ok::<(String, Decimal), PolyfillError>((tid.to_string(), t)),
+                None => {
+                    let t = self.get_tick_size(tid).await?;
+                    Ok((tid.to_string(), t))
+                },
+            }
+        });
+
+        // 3b. Build neg_risk future list: cached resolver per unique token.
+        let neg_futures = unique_tokens.iter().map(|&tid| async move {
+            match supplied_neg {
+                Some(nr) => Ok::<(String, bool), PolyfillError>((tid.to_string(), nr)),
+                None => {
+                    let nr = self.resolve_neg_risk_cached(tid).await?;
+                    Ok((tid.to_string(), nr))
+                },
+            }
+        });
+
+        // 3c. Fire everything concurrently. Two parallel try_join_alls ensures
+        //     tick_size and neg_risk fetches race each other across tokens.
+        let (tick_results, neg_results) =
+            futures::try_join!(try_join_all(tick_futures), try_join_all(neg_futures),)?;
+
+        // 4. Build the resolved options map: token_id -> OrderOptions with both
+        //    Some(_) filled in.
+        let mut resolved: HashMap<String, OrderOptions> =
+            HashMap::with_capacity(unique_tokens.len());
+        for ((tid, tick), (_, nr)) in tick_results.into_iter().zip(neg_results.into_iter()) {
+            resolved.insert(
+                tid,
+                OrderOptions {
+                    tick_size: Some(tick),
+                    neg_risk: Some(nr),
+                    fee_rate_bps: supplied_fee,
+                },
+            );
+        }
+
+        // 5. Per-order price-range validation + 6. sign directly.
+        let mut signed_orders: Vec<SignedOrderRequest> = Vec::with_capacity(order_args.len());
+        let extras = crate::types::ExtraOrderArgs::default();
+        for args in order_args {
+            let opts = resolved
+                .get(args.token_id.as_str())
+                .expect("resolved map must contain every unique token_id from the input batch");
+            let tick_size = opts.tick_size.expect("Should be filled");
+            if !self.is_price_in_range(args.price, tick_size) {
+                return Err(PolyfillError::validation(
+                    "Price is not in range of tick_size",
+                ));
+            }
+            let signed = order_builder.create_order(self.chain_id, args, 0, &extras, opts)?;
+            signed_orders.push(signed);
+        }
+
+        // 7. Single POST.
+        self.post_orders(signed_orders, order_type).await
     }
 
-    /// Create and post multiple orders in one call (defaults to GTC)
+    /// Create and post multiple orders in one call with an explicit order type.
+    ///
+    /// If `options` is `Some(_)`, its `tick_size` / `neg_risk` values are applied
+    /// to every order in the batch without issuing HTTP lookups for the fields
+    /// that are `Some`. Any fields left `None` are resolved per-batch: unique
+    /// `token_id`s are deduped and missing lookups are fired concurrently.
+    ///
+    /// `neg_risk` resolution additionally consults the permanent client-lifetime
+    /// cache (`resolve_neg_risk_cached`), so repeated cold-options batches on the
+    /// same market only issue the `/neg-risk` GET once.
+    pub async fn create_and_post_orders_with_type(
+        &self,
+        order_args: &[OrderArgs],
+        options: Option<&OrderOptions>,
+        order_type: OrderType,
+    ) -> Result<Vec<crate::types::PostOrderResponse>> {
+        self.create_and_post_orders_inner(order_args, options, order_type)
+            .await
+    }
+
+    /// Create and post multiple orders in one call (defaults to GTC).
+    ///
+    /// See `create_and_post_orders_with_type` for the semantics of `options`.
     pub async fn create_and_post_orders(
         &self,
         order_args: &[OrderArgs],
+        options: Option<&OrderOptions>,
     ) -> Result<Vec<crate::types::PostOrderResponse>> {
-        self.create_and_post_orders_with_type(order_args, OrderType::GTC)
+        self.create_and_post_orders_inner(order_args, options, OrderType::GTC)
             .await
     }
 
@@ -3615,5 +3793,502 @@ mod tests {
         let approved = client.approve_rfq_order(&exec).await.unwrap();
         assert_eq!(approved.trade_ids, vec!["t1".to_string(), "t2".to_string()]);
         approve_mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_neg_risk_cache_hit_on_second_create_order() {
+        let mut server = Server::new_async().await;
+
+        // tick_size: called twice (not cached by design).
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        // neg_risk: must be called exactly once despite two create_order calls.
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"neg_risk":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args = ClientOrderArgs::new(
+            "123",
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("10").unwrap(),
+            Side::BUY,
+        );
+
+        let _ = client.create_order(&args, None, None, None).await.unwrap();
+        let _ = client.create_order(&args, None, None, None).await.unwrap();
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warmup_neg_risk_populates_cache() {
+        let mut server = Server::new_async().await;
+
+        // Warmup hits each token once; the follow-up create_order calls must
+        // then hit /neg-risk zero additional times.
+        let neg_mock_a = server
+            .mock("GET", "/neg-risk")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "111".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"neg_risk":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let neg_mock_b = server
+            .mock("GET", "/neg-risk")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "222".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"neg_risk":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tick_mock_a = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "111".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tick_mock_b = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "222".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        client.warmup_neg_risk(&["111", "222"]).await.unwrap();
+
+        let args_a = ClientOrderArgs::new(
+            "111",
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("10").unwrap(),
+            Side::BUY,
+        );
+        let args_b = ClientOrderArgs::new(
+            "222",
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("10").unwrap(),
+            Side::BUY,
+        );
+        let _ = client
+            .create_order(&args_a, None, None, None)
+            .await
+            .unwrap();
+        let _ = client
+            .create_order(&args_b, None, None, None)
+            .await
+            .unwrap();
+
+        neg_mock_a.assert_async().await;
+        neg_mock_b.assert_async().await;
+        tick_mock_a.assert_async().await;
+        tick_mock_b.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_with_options_skips_lookups() {
+        let mut server = Server::new_async().await;
+
+        // Zero tick-size and zero neg-risk GETs expected.
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .expect(0)
+            .create_async()
+            .await;
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"success":true,"orderID":"a"},{"success":true,"orderID":"b"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args = vec![
+            ClientOrderArgs::new(
+                "123",
+                Decimal::from_str("0.5").unwrap(),
+                Decimal::from_str("10").unwrap(),
+                Side::BUY,
+            ),
+            ClientOrderArgs::new(
+                "123",
+                Decimal::from_str("0.51").unwrap(),
+                Decimal::from_str("10").unwrap(),
+                Side::BUY,
+            ),
+        ];
+        let options = crate::types::OrderOptions {
+            tick_size: Some(Decimal::from_str("0.01").unwrap()),
+            neg_risk: Some(false),
+            fee_rate_bps: None,
+        };
+
+        let result = client
+            .create_and_post_orders_with_type(&args, Some(&options), crate::types::OrderType::GTC)
+            .await;
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+        orders_mock.assert_async().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_dedup_same_token() {
+        let mut server = Server::new_async().await;
+
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"neg_risk":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let orders_body = r#"[{"success":true,"orderID":"o0"},{"success":true,"orderID":"o1"},{"success":true,"orderID":"o2"},{"success":true,"orderID":"o3"},{"success":true,"orderID":"o4"},{"success":true,"orderID":"o5"},{"success":true,"orderID":"o6"},{"success":true,"orderID":"o7"},{"success":true,"orderID":"o8"},{"success":true,"orderID":"o9"},{"success":true,"orderID":"o10"},{"success":true,"orderID":"o11"},{"success":true,"orderID":"o12"},{"success":true,"orderID":"o13"},{"success":true,"orderID":"o14"}]"#;
+
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(orders_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args: Vec<_> = (0..15)
+            .map(|i| {
+                ClientOrderArgs::new(
+                    "123",
+                    Decimal::from_str(&format!("0.{:02}", 10 + i)).unwrap(),
+                    Decimal::from_str("10").unwrap(),
+                    Side::BUY,
+                )
+            })
+            .collect();
+
+        let result = client
+            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .await;
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+        orders_mock.assert_async().await;
+        assert!(result.is_ok(), "batch post failed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 15);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_partial_options_tick_only() {
+        let mut server = Server::new_async().await;
+
+        // tick_size supplied → zero GETs expected.
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .expect(0)
+            .create_async()
+            .await;
+
+        // neg_risk missing → exactly one GET.
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"neg_risk":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"success":true,"orderID":"a"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args = vec![ClientOrderArgs::new(
+            "123",
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("10").unwrap(),
+            Side::BUY,
+        )];
+        let options = crate::types::OrderOptions {
+            tick_size: Some(Decimal::from_str("0.01").unwrap()),
+            neg_risk: None,
+            fee_rate_bps: None,
+        };
+
+        let result = client
+            .create_and_post_orders_with_type(&args, Some(&options), crate::types::OrderType::GTC)
+            .await;
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+        orders_mock.assert_async().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_partial_options_neg_risk_only() {
+        let mut server = Server::new_async().await;
+
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"success":true,"orderID":"a"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args = vec![ClientOrderArgs::new(
+            "123",
+            Decimal::from_str("0.5").unwrap(),
+            Decimal::from_str("10").unwrap(),
+            Side::BUY,
+        )];
+        let options = crate::types::OrderOptions {
+            tick_size: None,
+            neg_risk: Some(false),
+            fee_rate_bps: None,
+        };
+
+        let result = client
+            .create_and_post_orders_with_type(&args, Some(&options), crate::types::OrderType::GTC)
+            .await;
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+        orders_mock.assert_async().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_distinct_tokens_parallel_fetch() {
+        let mut server = Server::new_async().await;
+
+        // 3 unique tokens → 3 tick_size + 3 neg_risk GETs.
+        for tid in ["111", "222", "333"] {
+            server
+                .mock("GET", "/tick-size")
+                .match_query(Matcher::UrlEncoded("token_id".into(), tid.into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            server
+                .mock("GET", "/neg-risk")
+                .match_query(Matcher::UrlEncoded("token_id".into(), tid.into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"neg_risk":false}"#)
+                .expect(1)
+                .create_async()
+                .await;
+        }
+
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"success":true,"orderID":"a"},{"success":true,"orderID":"b"},{"success":true,"orderID":"c"}]"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args = vec![
+            ClientOrderArgs::new(
+                "111",
+                Decimal::from_str("0.5").unwrap(),
+                Decimal::from_str("10").unwrap(),
+                Side::BUY,
+            ),
+            ClientOrderArgs::new(
+                "222",
+                Decimal::from_str("0.5").unwrap(),
+                Decimal::from_str("10").unwrap(),
+                Side::BUY,
+            ),
+            ClientOrderArgs::new(
+                "333",
+                Decimal::from_str("0.5").unwrap(),
+                Decimal::from_str("10").unwrap(),
+                Side::BUY,
+            ),
+        ];
+
+        let result = client
+            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .await;
+
+        orders_mock.assert_async().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_price_out_of_range_fails_before_post() {
+        let mut server = Server::new_async().await;
+
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size":"0.01"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "123".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"neg_risk":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Critical: /orders must NOT be called.
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        // Price 0.005 is below tick_size 0.01 — out of range.
+        let args = vec![ClientOrderArgs::new(
+            "123",
+            Decimal::from_str("0.005").unwrap(),
+            Decimal::from_str("10").unwrap(),
+            Side::BUY,
+        )];
+
+        let result = client
+            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .await;
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+        orders_mock.assert_async().await;
+        assert!(matches!(result, Err(PolyfillError::Validation { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_orders_batch_too_large_validated_before_fetches() {
+        let mut server = Server::new_async().await;
+
+        // Critical: NOTHING should be called — validation short-circuits.
+        let tick_mock = server
+            .mock("GET", "/tick-size")
+            .expect(0)
+            .create_async()
+            .await;
+        let neg_mock = server
+            .mock("GET", "/neg-risk")
+            .expect(0)
+            .create_async()
+            .await;
+        let orders_mock = server
+            .mock("POST", "/orders")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let args: Vec<_> = (0..16)
+            .map(|_| {
+                ClientOrderArgs::new(
+                    "123",
+                    Decimal::from_str("0.5").unwrap(),
+                    Decimal::from_str("10").unwrap(),
+                    Side::BUY,
+                )
+            })
+            .collect();
+
+        let result = client
+            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .await;
+
+        tick_mock.assert_async().await;
+        neg_mock.assert_async().await;
+        orders_mock.assert_async().await;
+        assert!(matches!(result, Err(PolyfillError::Validation { .. })));
     }
 }

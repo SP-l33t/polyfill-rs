@@ -152,7 +152,6 @@ pub fn qty_to_decimal(units: Qty) -> Decimal {
     Decimal::from(units) / Decimal::from(SCALE_FACTOR)
 }
 
-
 /// Trading side for orders
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(clippy::upper_case_acronyms)]
@@ -356,7 +355,6 @@ pub struct OrderBook {
     /// Sequence number
     pub sequence: u64,
 }
-
 
 /// Trade execution event
 #[derive(Debug, Clone, Serialize, Deserialize)]
