@@ -2,7 +2,7 @@
 // These tests hit the real Polymarket API and are ignored by default
 // Run with: cargo test --test integration_tests -- --ignored --test-threads=1
 
-use polyfill_rs::{ClobClient, OrderArgs, Side};
+use polyfill_rs::{ClobClient, OrderArgs, Side, SubmitOptions};
 use rust_decimal_macros::dec;
 use std::env;
 
@@ -104,7 +104,9 @@ async fn test_real_api_authenticated_order_flow() {
         side,
     };
 
-    let post_result = client.create_and_post_order(&order_args).await;
+    let post_result = client
+        .create_and_post_order(&order_args, SubmitOptions::default())
+        .await;
 
     // This is the critical test - did we get past the 401 error?
     match &post_result {

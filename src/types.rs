@@ -9,6 +9,8 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::errors::PolyfillError;
+
 // ============================================================================
 // FIXED-POINT OPTIMIZATION FOR HOT PATH PERFORMANCE
 // ============================================================================
@@ -247,6 +249,56 @@ impl OrderType {
     }
 }
 
+/// Per-submission flags for `POST /order` and `POST /orders`.
+///
+/// Bundles `order_type` with `post_only` (and leaves room for future
+/// per-request flags such as `deferExec`). `Default` yields
+/// `{ order_type: GTC, post_only: false }`, which matches the pre-post-only
+/// default behaviour of the post methods and serializes to a byte-identical
+/// wire body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitOptions {
+    pub order_type: OrderType,
+    pub post_only: bool,
+}
+
+impl Default for SubmitOptions {
+    fn default() -> Self {
+        Self {
+            order_type: OrderType::GTC,
+            post_only: false,
+        }
+    }
+}
+
+impl SubmitOptions {
+    /// Fallible constructor — validates the combination up-front.
+    ///
+    /// Returns [`PolyfillError::Validation`] if `post_only` is combined with
+    /// `FOK` or `FAK`. Post-only orders are only valid with `GTC` and `GTD`
+    /// (upstream Polymarket CLOB constraint).
+    pub fn new(order_type: OrderType, post_only: bool) -> Result<Self> {
+        let opts = Self {
+            order_type,
+            post_only,
+        };
+        opts.validate()?;
+        Ok(opts)
+    }
+
+    /// Shared validation — called by every public method that accepts a
+    /// `SubmitOptions` and by [`SubmitOptions::new`]. Cheap (a single branch),
+    /// so it is applied as defence-in-depth at every post-path entry point.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.post_only && !matches!(self.order_type, OrderType::GTC | OrderType::GTD) {
+            return Err(PolyfillError::validation(
+                "postOnly is only supported for GTC and GTD orders",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Order status in the system
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
@@ -481,14 +533,22 @@ pub struct PostOrder {
     pub order: SignedOrderRequest,
     pub owner: String,
     pub order_type: OrderType,
+    // `rename_all = "camelCase"` converts `post_only` → `postOnly` on the wire.
+    // `skip_serializing_if` is the critical bit: `None` omits the field entirely,
+    // preserving byte-identical bodies for callers that don't opt into post-only.
+    // We only ever store `Some(true)` — never `Some(false)` — mirroring upstream
+    // rs-clob-client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_only: Option<bool>,
 }
 
 impl PostOrder {
-    pub fn new(order: SignedOrderRequest, owner: String, order_type: OrderType) -> Self {
+    pub fn new(order: SignedOrderRequest, owner: String, options: SubmitOptions) -> Self {
         Self {
             order,
             owner,
-            order_type,
+            order_type: options.order_type,
+            post_only: if options.post_only { Some(true) } else { None },
         }
     }
 }
@@ -1754,7 +1814,8 @@ pub type OrderArgs = OrderRequest;
 
 #[cfg(test)]
 mod tests {
-    use super::OrderType;
+    use super::{OrderType, PostOrder, SignedOrderRequest, SubmitOptions};
+    use crate::errors::PolyfillError;
 
     #[test]
     fn test_order_type_fak_serde_and_string() {
@@ -1765,5 +1826,142 @@ mod tests {
 
         let parsed: OrderType = serde_json::from_str("\"FAK\"").unwrap();
         assert_eq!(parsed, OrderType::FAK);
+    }
+
+    #[test]
+    fn submit_options_default_is_gtc_not_post_only() {
+        let opts = SubmitOptions::default();
+        assert_eq!(opts.order_type, OrderType::GTC);
+        assert!(!opts.post_only);
+    }
+
+    #[test]
+    fn submit_options_new_rejects_post_only_with_fok() {
+        let err = SubmitOptions::new(OrderType::FOK, true).unwrap_err();
+        assert!(matches!(err, PolyfillError::Validation { .. }));
+    }
+
+    #[test]
+    fn submit_options_new_rejects_post_only_with_fak() {
+        let err = SubmitOptions::new(OrderType::FAK, true).unwrap_err();
+        assert!(matches!(err, PolyfillError::Validation { .. }));
+    }
+
+    #[test]
+    fn submit_options_new_accepts_post_only_with_gtc() {
+        let opts = SubmitOptions::new(OrderType::GTC, true).unwrap();
+        assert_eq!(opts.order_type, OrderType::GTC);
+        assert!(opts.post_only);
+    }
+
+    #[test]
+    fn submit_options_new_accepts_post_only_with_gtd() {
+        let opts = SubmitOptions::new(OrderType::GTD, true).unwrap();
+        assert_eq!(opts.order_type, OrderType::GTD);
+        assert!(opts.post_only);
+    }
+
+    #[test]
+    fn submit_options_new_accepts_non_post_only_with_every_order_type() {
+        for ot in [
+            OrderType::GTC,
+            OrderType::GTD,
+            OrderType::FOK,
+            OrderType::FAK,
+        ] {
+            let opts = SubmitOptions::new(ot, false).expect("post_only=false is always valid");
+            assert_eq!(opts.order_type, ot);
+            assert!(!opts.post_only);
+        }
+    }
+
+    fn dummy_signed_order() -> SignedOrderRequest {
+        SignedOrderRequest {
+            salt: 1,
+            maker: "0xmaker".to_string(),
+            signer: "0xsigner".to_string(),
+            taker: "0xtaker".to_string(),
+            token_id: "token".to_string(),
+            maker_amount: "100".to_string(),
+            taker_amount: "50".to_string(),
+            expiration: "0".to_string(),
+            nonce: "0".to_string(),
+            fee_rate_bps: "0".to_string(),
+            side: "BUY".to_string(),
+            signature_type: 0,
+            signature: "0xsig".to_string(),
+        }
+    }
+
+    #[test]
+    fn post_order_serializes_post_only_when_true() {
+        let order = PostOrder::new(
+            dummy_signed_order(),
+            "owner-key".to_string(),
+            SubmitOptions {
+                order_type: OrderType::GTC,
+                post_only: true,
+            },
+        );
+        let value = serde_json::to_value(&order).expect("serialize PostOrder");
+        let obj = value
+            .as_object()
+            .expect("PostOrder should be a JSON object");
+
+        // postOnly is a sibling of order / owner / orderType, not nested.
+        assert_eq!(
+            obj.get("postOnly"),
+            Some(&serde_json::Value::Bool(true)),
+            "postOnly should serialize as top-level true: {value:?}"
+        );
+        // Sanity: the field is NOT buried inside the nested order.
+        let order_obj = obj
+            .get("order")
+            .and_then(|v| v.as_object())
+            .expect("order should be an object");
+        assert!(
+            !order_obj.contains_key("postOnly"),
+            "postOnly must not be nested inside order"
+        );
+    }
+
+    #[test]
+    fn post_order_omits_post_only_by_default() {
+        let order = PostOrder::new(
+            dummy_signed_order(),
+            "owner-key".to_string(),
+            SubmitOptions::default(),
+        );
+        let value = serde_json::to_value(&order).expect("serialize PostOrder");
+        let obj = value
+            .as_object()
+            .expect("PostOrder should be a JSON object");
+
+        assert!(
+            !obj.contains_key("postOnly"),
+            "postOnly must be omitted when not opted in: {value:?}"
+        );
+    }
+
+    #[test]
+    fn post_order_omits_post_only_when_explicitly_false() {
+        let order = PostOrder::new(
+            dummy_signed_order(),
+            "owner-key".to_string(),
+            SubmitOptions {
+                order_type: OrderType::GTC,
+                post_only: false,
+            },
+        );
+        let value = serde_json::to_value(&order).expect("serialize PostOrder");
+        let obj = value
+            .as_object()
+            .expect("PostOrder should be a JSON object");
+
+        // We deliberately never emit `postOnly: false` on the wire — match upstream.
+        assert!(
+            !obj.contains_key("postOnly"),
+            "postOnly must be omitted (never serialized as false): {value:?}"
+        );
     }
 }

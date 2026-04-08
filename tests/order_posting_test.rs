@@ -1,5 +1,5 @@
 // Test order posting - the critical endpoint that had the 401 bug
-use polyfill_rs::{ClobClient, OrderArgs, Side};
+use polyfill_rs::{ClobClient, OrderArgs, Side, SubmitOptions};
 use rust_decimal::Decimal;
 use std::env;
 use std::str::FromStr;
@@ -33,7 +33,9 @@ async fn test_post_order_authentication() {
         side: Side::BUY,
     };
 
-    let result = client.create_and_post_order(&order_args).await;
+    let result = client
+        .create_and_post_order(&order_args, SubmitOptions::default())
+        .await;
 
     match result {
         Ok(response) => {

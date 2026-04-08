@@ -38,7 +38,10 @@
 //!         Side::BUY,
 //!     );
 //!
-//!     let result = client.create_and_post_order(&order_args).await.unwrap();
+//!     let result = client
+//!         .create_and_post_order(&order_args, polyfill_rs::SubmitOptions::default())
+//!         .await
+//!         .unwrap();
 //!     println!("Order posted: {:?}", result);
 //!
 //!     Ok(())
@@ -143,6 +146,7 @@ pub use crate::types::{
     SimplifiedMarketsResponse,
     SpreadResponse,
     StreamMessage,
+    SubmitOptions,
     TickSizeResponse,
     Token,
     TokenPrice,

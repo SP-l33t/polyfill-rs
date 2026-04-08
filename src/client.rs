@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 // Re-export types for compatibility
-pub use crate::types::{ApiCredentials as ApiCreds, OrderType, Side};
+pub use crate::types::{ApiCredentials as ApiCreds, OrderType, Side, SubmitOptions};
 
 // Compatibility types
 #[derive(Debug)]
@@ -1036,12 +1036,18 @@ impl ClobClient {
         )
     }
 
-    /// Post an order to the exchange
+    /// Post a signed order to the exchange.
+    ///
+    /// `options` carries the `OrderType` and the optional `post_only` flag.
+    /// Passing [`SubmitOptions::default()`] preserves the pre-post-only
+    /// behaviour (GTC, no post-only) and produces a byte-identical wire body.
     pub async fn post_order(
         &self,
         order: SignedOrderRequest,
-        order_type: OrderType,
+        options: SubmitOptions,
     ) -> Result<crate::types::PostOrderResponse> {
+        options.validate()?;
+
         let signer = self
             .signer
             .as_ref()
@@ -1053,7 +1059,7 @@ impl ClobClient {
 
         // Owner field must reference the credential principal identifier
         // to maintain consistency with the authentication context layer
-        let body = PostOrder::new(order, api_creds.api_key.clone(), order_type);
+        let body = PostOrder::new(order, api_creds.api_key.clone(), options);
 
         let headers = create_l2_headers(signer, api_creds, "POST", "/order", Some(&body))?;
         let req = self.create_request_with_headers(Method::POST, "/order", headers.into_iter());
@@ -1073,12 +1079,19 @@ impl ClobClient {
         Ok(response.json::<crate::types::PostOrderResponse>().await?)
     }
 
-    /// Post multiple orders to the exchange in a single request
+    /// Post multiple signed orders to the exchange in a single request.
+    ///
+    /// All orders in the batch share one [`SubmitOptions`] value, so every
+    /// order is either all-post-only or none. Per-order post-only is not
+    /// supported; see the design note in `docs/superpowers/specs/` for the
+    /// rationale.
     pub async fn post_orders(
         &self,
         orders: Vec<SignedOrderRequest>,
-        order_type: OrderType,
+        options: SubmitOptions,
     ) -> Result<Vec<crate::types::PostOrderResponse>> {
+        options.validate()?;
+
         if orders.is_empty() {
             return Err(PolyfillError::validation("orders cannot be empty"));
         }
@@ -1099,7 +1112,7 @@ impl ClobClient {
 
         let body: Vec<PostOrder> = orders
             .into_iter()
-            .map(|order| PostOrder::new(order, api_creds.api_key.clone(), order_type))
+            .map(|order| PostOrder::new(order, api_creds.api_key.clone(), options))
             .collect();
 
         let headers = create_l2_headers(signer, api_creds, "POST", "/orders", Some(&body))?;
@@ -1122,29 +1135,24 @@ impl ClobClient {
             .await?)
     }
 
-    /// Create and post an order in one call with an explicit order type
-    pub async fn create_and_post_order_with_type(
-        &self,
-        order_args: &OrderArgs,
-        order_type: OrderType,
-    ) -> Result<crate::types::PostOrderResponse> {
-        let order = self.create_order(order_args, None, None, None).await?;
-        self.post_order(order, order_type).await
-    }
-
-    /// Create and post an order in one call (defaults to GTC)
+    /// Create (sign) and post a single order in one call.
+    ///
+    /// Pass [`SubmitOptions::default()`] for the pre-post-only default
+    /// (`GTC`, no post-only).
     pub async fn create_and_post_order(
         &self,
         order_args: &OrderArgs,
+        options: SubmitOptions,
     ) -> Result<crate::types::PostOrderResponse> {
-        self.create_and_post_order_with_type(order_args, OrderType::GTC)
-            .await
+        options.validate()?;
+        let order = self.create_order(order_args, None, None, None).await?;
+        self.post_order(order, options).await
     }
 
-    /// Inner implementation shared by both public batch create+post methods.
+    /// Inner implementation shared by the public batch create+post method.
     ///
     /// Flow:
-    /// 1. Fast-fail validation (empty, >15 orders) — before any HTTP.
+    /// 1. Fast-fail validation (submit opts, empty, >15 orders) — before any HTTP.
     /// 2. Collect unique token_ids from the batch.
     /// 3. For each unique token, queue missing tick_size / neg_risk lookups.
     ///    Queued lookups are fired concurrently via `try_join_all`.
@@ -1157,9 +1165,10 @@ impl ClobClient {
         &self,
         order_args: &[OrderArgs],
         options: Option<&OrderOptions>,
-        order_type: OrderType,
+        submit_options: SubmitOptions,
     ) -> Result<Vec<crate::types::PostOrderResponse>> {
         // 1. Fast-fail validation — before any HTTP.
+        submit_options.validate()?;
         if order_args.is_empty() {
             return Err(PolyfillError::validation("order_args cannot be empty"));
         }
@@ -1249,38 +1258,31 @@ impl ClobClient {
         }
 
         // 7. Single POST.
-        self.post_orders(signed_orders, order_type).await
+        self.post_orders(signed_orders, submit_options).await
     }
 
-    /// Create and post multiple orders in one call with an explicit order type.
+    /// Create and post multiple orders in one call.
     ///
-    /// If `options` is `Some(_)`, its `tick_size` / `neg_risk` values are applied
-    /// to every order in the batch without issuing HTTP lookups for the fields
-    /// that are `Some`. Any fields left `None` are resolved per-batch: unique
-    /// `token_id`s are deduped and missing lookups are fired concurrently.
-    ///
-    /// `neg_risk` resolution additionally consults the permanent client-lifetime
-    /// cache (`resolve_neg_risk_cached`), so repeated cold-options batches on the
+    /// `order_options` controls build-time hints (tick_size / neg_risk /
+    /// fee_rate_bps): if `Some(_)`, its values are applied to every order in
+    /// the batch without issuing HTTP lookups for fields that are `Some`. Any
+    /// fields left `None` are resolved per-batch: unique `token_id`s are
+    /// deduped and missing lookups are fired concurrently. `neg_risk`
+    /// resolution additionally consults the permanent client-lifetime cache
+    /// (`resolve_neg_risk_cached`), so repeated cold-options batches on the
     /// same market only issue the `/neg-risk` GET once.
-    pub async fn create_and_post_orders_with_type(
-        &self,
-        order_args: &[OrderArgs],
-        options: Option<&OrderOptions>,
-        order_type: OrderType,
-    ) -> Result<Vec<crate::types::PostOrderResponse>> {
-        self.create_and_post_orders_inner(order_args, options, order_type)
-            .await
-    }
-
-    /// Create and post multiple orders in one call (defaults to GTC).
     ///
-    /// See `create_and_post_orders_with_type` for the semantics of `options`.
+    /// `submit_options` controls submission-time flags (`OrderType`,
+    /// `post_only`). All orders in the batch share the same `submit_options`
+    /// — per-order post-only is not supported. Pass
+    /// [`SubmitOptions::default()`] for the pre-post-only default behaviour.
     pub async fn create_and_post_orders(
         &self,
         order_args: &[OrderArgs],
-        options: Option<&OrderOptions>,
+        order_options: Option<&OrderOptions>,
+        submit_options: SubmitOptions,
     ) -> Result<Vec<crate::types::PostOrderResponse>> {
-        self.create_and_post_orders_inner(order_args, options, OrderType::GTC)
+        self.create_and_post_orders_inner(order_args, order_options, submit_options)
             .await
     }
 
@@ -3217,7 +3219,7 @@ mod tests {
         let result = client
             .post_orders(
                 vec![signed_order.clone(), signed_order],
-                crate::types::OrderType::GTC,
+                crate::types::SubmitOptions::default(),
             )
             .await;
 
@@ -3232,7 +3234,7 @@ mod tests {
     async fn test_post_orders_batch_empty_validation() {
         let client = create_test_client_with_l2_auth("https://test.example.com");
         let result = client
-            .post_orders(Vec::new(), crate::types::OrderType::GTC)
+            .post_orders(Vec::new(), crate::types::SubmitOptions::default())
             .await;
         assert!(matches!(result, Err(PolyfillError::Validation { .. })));
     }
@@ -3243,7 +3245,7 @@ mod tests {
         let orders = (0..16).map(|_| sample_signed_order()).collect::<Vec<_>>();
 
         let result = client
-            .post_orders(orders, crate::types::OrderType::GTC)
+            .post_orders(orders, crate::types::SubmitOptions::default())
             .await;
         assert!(matches!(result, Err(PolyfillError::Validation { .. })));
     }
@@ -3262,7 +3264,13 @@ mod tests {
 
         let client = create_test_client_with_l2_auth(&server.url());
         let result = client
-            .post_order(sample_signed_order(), crate::types::OrderType::FAK)
+            .post_order(
+                sample_signed_order(),
+                crate::types::SubmitOptions {
+                    order_type: crate::types::OrderType::FAK,
+                    post_only: false,
+                },
+            )
             .await;
 
         mock.assert_async().await;
@@ -3284,12 +3292,110 @@ mod tests {
 
         let client = create_test_client_with_l2_auth(&server.url());
         let result = client
-            .post_orders(vec![sample_signed_order()], crate::types::OrderType::FAK)
+            .post_orders(
+                vec![sample_signed_order()],
+                crate::types::SubmitOptions {
+                    order_type: crate::types::OrderType::FAK,
+                    post_only: false,
+                },
+            )
             .await;
 
         mock.assert_async().await;
         assert!(result.is_ok());
         assert!(result.unwrap()[0].success);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_order_post_only_sends_postonly_true() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/order")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::Regex(r#""orderType":"GTC""#.to_string()),
+                Matcher::Regex(r#""postOnly":true"#.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"orderID":"a"}"#)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let result = client
+            .post_order(
+                sample_signed_order(),
+                crate::types::SubmitOptions::new(crate::types::OrderType::GTC, true).unwrap(),
+            )
+            .await;
+
+        mock.assert_async().await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().success);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_orders_post_only_sends_postonly_true() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/orders")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::Regex(r#""orderType":"GTC""#.to_string()),
+                Matcher::Regex(r#""postOnly":true"#.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"success":true,"orderID":"a"},{"success":true,"orderID":"b"}]"#)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+        let signed_order = sample_signed_order();
+        let result = client
+            .post_orders(
+                vec![signed_order.clone(), signed_order],
+                crate::types::SubmitOptions::new(crate::types::OrderType::GTC, true).unwrap(),
+            )
+            .await;
+
+        mock.assert_async().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_order_post_only_with_fok_fails_before_http() {
+        let server = Server::new_async().await;
+        // No mock expectation — if the method sends an HTTP request, the call
+        // will hit a dead URL and fail with a transport error rather than a
+        // validation error, which makes the assertion below fail.
+        let client = create_test_client_with_l2_auth(&server.url());
+        let result = client
+            .post_order(
+                sample_signed_order(),
+                crate::types::SubmitOptions {
+                    order_type: crate::types::OrderType::FOK,
+                    post_only: true,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(PolyfillError::Validation { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_post_orders_post_only_with_fak_fails_before_http() {
+        let server = Server::new_async().await;
+        let client = create_test_client_with_l2_auth(&server.url());
+        let result = client
+            .post_orders(
+                vec![sample_signed_order()],
+                crate::types::SubmitOptions {
+                    order_type: crate::types::OrderType::FAK,
+                    post_only: true,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(PolyfillError::Validation { .. })));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3959,7 +4065,11 @@ mod tests {
         };
 
         let result = client
-            .create_and_post_orders_with_type(&args, Some(&options), crate::types::OrderType::GTC)
+            .create_and_post_orders(
+                &args,
+                Some(&options),
+                crate::types::SubmitOptions::default(),
+            )
             .await;
 
         tick_mock.assert_async().await;
@@ -4017,7 +4127,7 @@ mod tests {
             .collect();
 
         let result = client
-            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .create_and_post_orders(&args, None, crate::types::SubmitOptions::default())
             .await;
 
         tick_mock.assert_async().await;
@@ -4072,7 +4182,11 @@ mod tests {
         };
 
         let result = client
-            .create_and_post_orders_with_type(&args, Some(&options), crate::types::OrderType::GTC)
+            .create_and_post_orders(
+                &args,
+                Some(&options),
+                crate::types::SubmitOptions::default(),
+            )
             .await;
 
         tick_mock.assert_async().await;
@@ -4124,7 +4238,11 @@ mod tests {
         };
 
         let result = client
-            .create_and_post_orders_with_type(&args, Some(&options), crate::types::OrderType::GTC)
+            .create_and_post_orders(
+                &args,
+                Some(&options),
+                crate::types::SubmitOptions::default(),
+            )
             .await;
 
         tick_mock.assert_async().await;
@@ -4191,7 +4309,7 @@ mod tests {
         ];
 
         let result = client
-            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .create_and_post_orders(&args, None, crate::types::SubmitOptions::default())
             .await;
 
         orders_mock.assert_async().await;
@@ -4240,7 +4358,7 @@ mod tests {
         )];
 
         let result = client
-            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .create_and_post_orders(&args, None, crate::types::SubmitOptions::default())
             .await;
 
         tick_mock.assert_async().await;
@@ -4283,7 +4401,7 @@ mod tests {
             .collect();
 
         let result = client
-            .create_and_post_orders_with_type(&args, None, crate::types::OrderType::GTC)
+            .create_and_post_orders(&args, None, crate::types::SubmitOptions::default())
             .await;
 
         tick_mock.assert_async().await;
