@@ -1242,7 +1242,6 @@ impl ClobClient {
 
         // 5. Per-order price-range validation + 6. sign directly.
         let mut signed_orders: Vec<SignedOrderRequest> = Vec::with_capacity(order_args.len());
-        let extras = crate::types::ExtraOrderArgs::default();
         for args in order_args {
             let opts = resolved
                 .get(args.token_id.as_str())
@@ -1253,6 +1252,10 @@ impl ClobClient {
                     "Price is not in range of tick_size",
                 ));
             }
+            let extras = crate::types::ExtraOrderArgs {
+                fee_rate_bps: opts.fee_rate_bps.unwrap_or(0),
+                ..Default::default()
+            };
             let signed = order_builder.create_order(self.chain_id, args, 0, &extras, opts)?;
             signed_orders.push(signed);
         }
